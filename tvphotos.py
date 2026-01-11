@@ -100,6 +100,28 @@ def read_locale_value():
     return read_config_value("locale", required=False)
 
 
+def read_delay_value():
+    val = read_config_value("delay_s", required=False)
+    if val is None:
+        val = read_config_value("delay", required=False)
+    if val is None:
+        return None
+    try:
+        d = int(val)
+    except Exception:
+        return None
+    if d < 1:
+        d = 1
+    if d > 24 * 3600:
+        d = 24 * 3600
+    return d
+
+
+def default_delay_s():
+    d = read_delay_value()
+    return d if d is not None else DEFAULT_DELAY_S
+
+
 def apply_locale_from_config():
     loc = read_locale_value()
     if not loc:
@@ -428,7 +450,7 @@ class ImageManager:
         self.lock = threading.Lock()
         self.disabled = set()
         self.active_source_x = 2
-        self.delay_s = DEFAULT_DELAY_S
+        self.delay_s = default_delay_s()
         self._files = []
         self.load_state()
         self.refresh_files()
@@ -437,7 +459,7 @@ class ImageManager:
         with self.lock:
             self.disabled = set()
             self.active_source_x = 2
-            self.delay_s = DEFAULT_DELAY_S
+            self.delay_s = default_delay_s()
             try:
                 with open(self.state_path, "r", encoding="utf-8") as f:
                     d = json.load(f)
@@ -447,9 +469,9 @@ class ImageManager:
                 except Exception:
                     self.active_source_x = 2
                 try:
-                    self.delay_s = int(d.get("delay_s", DEFAULT_DELAY_S))
+                    self.delay_s = int(d.get("delay_s", default_delay_s()))
                 except Exception:
-                    self.delay_s = DEFAULT_DELAY_S
+                    self.delay_s = default_delay_s()
             except FileNotFoundError:
                 pass
             except Exception:
@@ -601,7 +623,7 @@ class ImageManager:
         try:
             d = int(delay_s)
         except Exception:
-            d = DEFAULT_DELAY_S
+            d = default_delay_s()
         if d < 1:
             d = 1
         if d > 24 * 3600:
@@ -719,7 +741,7 @@ class Slideshow(QWidget):
         try:
             d = int(delay_s)
         except Exception:
-            d = DEFAULT_DELAY_S
+            d = default_delay_s()
         if d < 1:
             d = 1
         if d > 24 * 3600:
@@ -761,7 +783,7 @@ class Slideshow(QWidget):
         self.clock.move(self.width() - w - self.margin, self.margin)
 
     def tick(self):
-        self.clock.setText(datetime.now().strftime("%A %d %B %Y\n%H:%M:%S"))
+        self.clock.setText(datetime.now().strftime("%A %d %B %Y\n%H:%M"))
         self.layout_clock()
 
     def _show_path(self, path):
@@ -990,7 +1012,7 @@ def make_handler(mgr, slideshow, hub):
                         msg = {}
 
                     if msg.get("type") == "set_delay":
-                        delay_s = msg.get("delay_s", DEFAULT_DELAY_S)
+                        delay_s = msg.get("delay_s", default_delay_s())
                         d = mgr.set_delay(delay_s)
                         QMetaObject.invokeMethod(slideshow, "apply_delay",
                             Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
@@ -1173,7 +1195,7 @@ def make_handler(mgr, slideshow, hub):
                 return self._json({"ok": True, "bytes": n, "url": url})
 
             if route == "/api/config/delay":
-                d = mgr.set_delay(body.get("delay_s", DEFAULT_DELAY_S))
+                d = mgr.set_delay(body.get("delay_s", default_delay_s()))
                 QMetaObject.invokeMethod(slideshow, "apply_delay",
                     Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
                 return self._json({"ok": True, "delay_s": d})
@@ -1636,7 +1658,7 @@ def start_server(mgr, slideshow, hub, host="0.0.0.0", port=DEFAULT_PORT):
 
 
 def main():
-    delay = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_DELAY_S
+    delay = int(sys.argv[1]) if len(sys.argv) > 1 else default_delay_s()
     folder = sys.argv[2] if len(sys.argv) > 2 else "~/wallpapers"
     port = int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_PORT
 
