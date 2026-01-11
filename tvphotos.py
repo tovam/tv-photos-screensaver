@@ -12,6 +12,7 @@ import ipaddress
 import base64
 import hashlib
 import re
+import locale as pylocale
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -63,7 +64,7 @@ def now_ts():
     return int(time.time())
 
 
-def read_update_url():
+def read_config_value(key, required=False):
     path = os.path.expanduser(UPDATE_CONFIG_PATH)
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -74,16 +75,51 @@ def read_update_url():
                 m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.+)$", line)
                 if not m:
                     continue
-                key = m.group(1)
-                if key != "update_url":
+                k = m.group(1)
+                if k != key:
                     continue
                 val = m.group(2).strip()
                 if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
                     val = val[1:-1]
                 return val
     except FileNotFoundError:
-        raise FileNotFoundError(f"Config not found: {path}")
-    raise KeyError(f"update_url not found in {path}")
+        if required:
+            raise FileNotFoundError(f"Config not found: {path}")
+        return None
+    if required:
+        raise KeyError(f"{key} not found in {path}")
+    return None
+
+
+def read_update_url():
+    return read_config_value("update_url", required=True)
+
+
+def read_locale_value():
+    return read_config_value("locale", required=False)
+
+
+def apply_locale_from_config():
+    loc = read_locale_value()
+    if not loc:
+        return None
+
+    candidates = [loc]
+    alt = loc.replace("-", "_")
+    if alt != loc:
+        candidates.append(alt)
+    if "." not in alt:
+        candidates.append(alt + ".UTF-8")
+    if "." not in loc:
+        candidates.append(loc + ".UTF-8")
+
+    for cand in candidates:
+        try:
+            pylocale.setlocale(pylocale.LC_TIME, cand)
+            return cand
+        except Exception:
+            continue
+    return None
 
 
 def update_script_from_url(url):
@@ -998,6 +1034,7 @@ def make_handler(mgr, slideshow, hub):
                 return self._json({
                     "ok": True,
                     "folder": mgr.folder,
+                    "locale": read_locale_value(),
                     "delay_s": int(slideshow.delay_ms / 1000),
                     "current": os.path.basename(slideshow.current_path) if slideshow.current_path else "",
                     "images": mgr.list_images(),
@@ -1604,6 +1641,8 @@ def main():
 
     mgr = ImageManager(folder)
     mgr.set_delay(delay)
+
+    apply_locale_from_config()
 
     hub = WebSocketHub()
     app = QApplication(sys.argv)
