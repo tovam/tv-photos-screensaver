@@ -677,12 +677,24 @@ class Slideshow(QWidget):
             "ts": now_ts(),
         })
 
-    def set_delay(self, delay_s):
-        d = self.mgr.set_delay(delay_s)
+    @pyqtSlot(int)
+    def apply_delay(self, delay_s):
+        try:
+            d = int(delay_s)
+        except Exception:
+            d = DEFAULT_DELAY_S
+        if d < 1:
+            d = 1
+        if d > 24 * 3600:
+            d = 24 * 3600
         self.delay_ms = max(1000, int(d * 1000))
         self.t_slide.stop()
         self.t_slide.start(self.delay_ms)
         self._broadcast_state()
+
+    def set_delay(self, delay_s):
+        d = self.mgr.set_delay(delay_s)
+        self.apply_delay(d)
 
     def _rebuild_playlist(self):
         paths = self.mgr.enabled_paths()
@@ -942,7 +954,9 @@ def make_handler(mgr, slideshow, hub):
 
                     if msg.get("type") == "set_delay":
                         delay_s = msg.get("delay_s", DEFAULT_DELAY_S)
-                        QTimer.singleShot(0, lambda d=delay_s: slideshow.set_delay(d))
+                        d = mgr.set_delay(delay_s)
+                        QMetaObject.invokeMethod(slideshow, "apply_delay",
+                            Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
                     elif msg.get("type") == "next":
                         QTimer.singleShot(0, slideshow.show_next)
                     elif msg.get("type") == "show":
@@ -1122,7 +1136,8 @@ def make_handler(mgr, slideshow, hub):
 
             if route == "/api/config/delay":
                 d = mgr.set_delay(body.get("delay_s", DEFAULT_DELAY_S))
-                QTimer.singleShot(0, lambda: slideshow.set_delay(d))
+                QMetaObject.invokeMethod(slideshow, "apply_delay",
+                    Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
                 return self._json({"ok": True, "delay_s": d})
 
             if route == "/api/cec/playback":
@@ -1192,6 +1207,8 @@ INDEX_HTML = r"""<!doctype html>
       background: #000;
       z-index: 9999;
       display: none;
+      opacity: 0.5;
+      pointer-events: none;
     }
     #currentThumb {
       width: 100%;
@@ -1517,10 +1534,9 @@ async function setActiveSource(){
 
 async function setDelay(){
   const d = parseInt(document.getElementById('delay').value || "15", 10);
-  if(ws && ws.readyState === 1){
-    ws.send(JSON.stringify({type:"set_delay", delay_s:d}));
-  } else {
-    await apiPost('api/config/delay', {delay_s:d});
+  const j = await apiPost('api/config/delay', {delay_s:d});
+  if(j && typeof j.delay_s === 'number'){
+    document.getElementById('delay').value = j.delay_s;
   }
 }
 
