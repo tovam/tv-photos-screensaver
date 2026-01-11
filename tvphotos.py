@@ -44,6 +44,9 @@ ALLOWED_NETS = [
 ALLOWED_V6 = {ipaddress.ip_address("::1")}
 STATE_FILENAME = ".fehb_state.json"
 UPDATE_CONFIG_PATH = "~/.tvphotos.yml"
+FIT_TAG_WIDTH = "__fitw"
+FIT_TAG_HEIGHT = "__fith"
+FIT_HEIGHT_RATIO_THRESHOLD = 0.76
 
 
 def is_allowed_client_ip(ip_str):
@@ -160,20 +163,28 @@ def fit_cover(pil_img, target_w, target_h):
     canvas.paste(img, (left, top))
     return canvas
 
-def fit_cover_OLD(pil_img, target_w, target_h):
+def fit_width_cover(pil_img, target_w, target_h):
     if target_w <= 0 or target_h <= 0:
         return pil_img
     iw, ih = pil_img.size
     if iw <= 0 or ih <= 0:
         return pil_img
 
-    scale = max(target_w / iw, target_h / ih)
-    nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+    scale = target_w / iw
+    nw = target_w
+    nh = max(1, int(round(ih * scale)))
     img = pil_img.resize((nw, nh), Image.Resampling.LANCZOS)
 
-    left = max(0, (nw - target_w) // 2)
-    top = max(0, (nh - target_h) // 2)
-    return img.crop((left, top, left + target_w, top + target_h))
+    if nh == target_h:
+        return img
+    if nh > target_h:
+        top = max(0, (nh - target_h) // 2)
+        return img.crop((0, top, target_w, top + target_h))
+
+    canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+    top = (target_h - nh) // 2
+    canvas.paste(img, (0, top))
+    return canvas
 
 
 def pil_to_qpixmap(pil_img):
@@ -188,7 +199,11 @@ def load_pixmap_cover(path, target_w, target_h):
         img = Image.open(path)
         img = ImageOps.exif_transpose(img)
         img = img.convert("RGB")
-        img = fit_cover(img, target_w, target_h)
+        mode = choose_fit_mode(os.path.basename(path), img.width, img.height)
+        if mode == "width":
+            img = fit_width_cover(img, target_w, target_h)
+        else:
+            img = fit_cover(img, target_w, target_h)
         return pil_to_qpixmap(img)
     except Exception:
         return None
@@ -221,6 +236,47 @@ def sanitize_filename(name):
     if not name or name in (".", ".."):
         name = f"upload-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
     return name
+
+
+def fit_mode_from_name(name):
+    base = os.path.splitext(os.path.basename(name or ""))[0]
+    if base.endswith(FIT_TAG_WIDTH):
+        return "width"
+    if base.endswith(FIT_TAG_HEIGHT):
+        return "height"
+    return "auto"
+
+
+def strip_fit_tag(base):
+    for tag in (FIT_TAG_WIDTH, FIT_TAG_HEIGHT):
+        if base.endswith(tag):
+            return base[:-len(tag)]
+    return base
+
+
+def name_with_fit_mode(name, mode):
+    base, ext = os.path.splitext(os.path.basename(name or ""))
+    base = strip_fit_tag(base)
+    if mode == "width":
+        base = base + FIT_TAG_WIDTH
+    elif mode == "height":
+        base = base + FIT_TAG_HEIGHT
+    elif mode == "auto":
+        pass
+    else:
+        raise ValueError("bad fit mode")
+    return base + ext
+
+
+def choose_fit_mode(name, iw, ih):
+    mode = fit_mode_from_name(name)
+    if mode != "auto":
+        return mode
+    if iw <= 0 or ih <= 0:
+        return "width"
+    if (ih / iw) > FIT_HEIGHT_RATIO_THRESHOLD:
+        return "height"
+    return "width"
 
 
 # ----------------------------
@@ -394,6 +450,7 @@ class ImageManager:
             for p in self._files:
                 name = os.path.basename(p)
                 enabled = name not in self.disabled
+                fit_mode = fit_mode_from_name(name)
                 try:
                     st = os.stat(p)
                     size = st.st_size
@@ -401,7 +458,13 @@ class ImageManager:
                 except Exception:
                     size = 0
                     mtime = 0
-                out.append({"name": name, "enabled": enabled, "size": size, "mtime": mtime})
+                out.append({
+                    "name": name,
+                    "enabled": enabled,
+                    "fit_mode": fit_mode,
+                    "size": size,
+                    "mtime": mtime,
+                })
             return out
 
     def enabled_paths(self):
@@ -425,6 +488,32 @@ class ImageManager:
             else:
                 self.disabled.add(name)
         self.save_state()
+
+    def set_fit_mode(self, name, mode):
+        name = os.path.basename(name)
+        if mode not in ("auto", "width", "height"):
+            raise ValueError("invalid fit mode")
+
+        old_path = safe_join(self.folder, name)
+        if not os.path.exists(old_path):
+            raise FileNotFoundError("image not found")
+
+        new_name = name_with_fit_mode(name, mode)
+        if new_name == name:
+            return new_name
+
+        new_path = safe_join(self.folder, new_name)
+        if os.path.exists(new_path):
+            raise FileExistsError("target name exists")
+
+        os.rename(old_path, new_path)
+        with self.lock:
+            if name in self.disabled:
+                self.disabled.discard(name)
+                self.disabled.add(new_name)
+        self.save_state()
+        self.refresh_files()
+        return new_name
 
     def delete(self, name):
         name = os.path.basename(name)
@@ -583,8 +672,11 @@ class Slideshow(QWidget):
         self._playlist = paths
         self._idx = 0
 
-    def refresh_from_manager(self):
+    def refresh_from_manager(self, prefer_name=None):
         self._rebuild_playlist()
+        if prefer_name and self.mgr.has_file(prefer_name):
+            if self.show_specific_name(prefer_name):
+                return
         if self.current_path and not os.path.exists(self.current_path):
             self.current_path = None
         self.show_next()
@@ -947,6 +1039,24 @@ def make_handler(mgr, slideshow, hub):
                 QTimer.singleShot(0, slideshow.refresh_from_manager)
                 return self._json({"ok": True})
 
+            if route == "/api/images/fit":
+                name = body.get("name", "")
+                mode = body.get("mode", "auto")
+                if not name:
+                    return self._json({"ok": False, "error": "missing name"}, 400)
+                was_current = os.path.basename(slideshow.current_path or "") == os.path.basename(name)
+                try:
+                    new_name = mgr.set_fit_mode(name, mode)
+                except (FileNotFoundError, FileExistsError, ValueError) as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    return self._json({"ok": False, "error": str(e)}, 500)
+                if was_current:
+                    QTimer.singleShot(0, lambda n=new_name: slideshow.refresh_from_manager(n))
+                else:
+                    QTimer.singleShot(0, slideshow.refresh_from_manager)
+                return self._json({"ok": True, "name": new_name})
+
             if route == "/api/images/delete":
                 name = body.get("name", "")
                 if not name:
@@ -1299,6 +1409,22 @@ async function loadImages(){
       }
     };
 
+    const fitLabel = document.createElement('span');
+    fitLabel.className = 'small';
+    fitLabel.textContent = 'Fit:';
+
+    const fitSel = document.createElement('select');
+    fitSel.innerHTML = `
+      <option value="auto">Auto</option>
+      <option value="width">Fit width</option>
+      <option value="height">Fit height (bars)</option>
+    `;
+    fitSel.value = it.fit_mode || 'auto';
+    fitSel.title = 'Auto: height/width > 0.76 => Fit height (bars); otherwise Fit width';
+    fitSel.onchange = async () => {
+      await apiPost('api/images/fit', {name: it.name, mode: fitSel.value});
+    };
+
     const label = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
@@ -1317,6 +1443,8 @@ async function loadImages(){
     };
 
     row.appendChild(showBtn);
+    row.appendChild(fitLabel);
+    row.appendChild(fitSel);
     row.appendChild(label);
     row.appendChild(del);
 
