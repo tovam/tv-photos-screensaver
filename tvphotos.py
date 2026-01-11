@@ -43,6 +43,7 @@ ALLOWED_NETS = [
 ]
 ALLOWED_V6 = {ipaddress.ip_address("::1")}
 STATE_FILENAME = ".fehb_state.json"
+UPDATE_CONFIG_PATH = "~/.tvphotos.yml"
 
 
 def is_allowed_client_ip(ip_str):
@@ -57,6 +58,59 @@ def is_allowed_client_ip(ip_str):
 
 def now_ts():
     return int(time.time())
+
+
+def read_update_url():
+    path = os.path.expanduser(UPDATE_CONFIG_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.+)$", line)
+                if not m:
+                    continue
+                key = m.group(1)
+                if key != "update_url":
+                    continue
+                val = m.group(2).strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                return val
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Config not found: {path}")
+    raise KeyError(f"update_url not found in {path}")
+
+
+def update_script_from_url(url):
+    p = urlparse(url)
+    if p.scheme not in ("http", "https"):
+        raise ValueError("update_url must be http or https")
+
+    req = urllib.request.Request(url, headers={"User-Agent": "fehb/1.5"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+
+    if not data:
+        raise ValueError("empty update payload")
+
+    script_path = os.path.abspath(__file__)
+    st = os.stat(script_path)
+    tmp_path = script_path + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, script_path)
+        os.chmod(script_path, st.st_mode)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return len(data)
 
 
 def get_ipv4_addrs():
@@ -928,6 +982,16 @@ def make_handler(mgr, slideshow, hub):
                 QTimer.singleShot(0, slideshow.refresh_from_manager)
                 return self._json({"ok": True, "saved_as": fname})
 
+            if route == "/api/update":
+                try:
+                    url = read_update_url()
+                    n = update_script_from_url(url)
+                except (FileNotFoundError, KeyError, ValueError) as e:
+                    return self._json({"ok": False, "error": str(e)}, 400)
+                except Exception as e:
+                    return self._json({"ok": False, "error": str(e)}, 500)
+                return self._json({"ok": True, "bytes": n, "url": url})
+
             if route == "/api/config/delay":
                 d = mgr.set_delay(body.get("delay_s", DEFAULT_DELAY_S))
                 QTimer.singleShot(0, lambda: slideshow.set_delay(d))
@@ -1022,6 +1086,7 @@ INDEX_HTML = r"""<!doctype html>
   <div class="row" style="margin-bottom:10px;">
     <button class="primary" onclick="apiPost('api/slideshow/next', {})">Next image</button>
     <button class="gray" onclick="apiPost('api/images/refresh', {})">Refresh list</button>
+    <button class="gray" onclick="updateSelf()">Update</button>
     <button class="primary" onclick="apiPost('api/picsum', {})">Download picsum 1920×1080</button>
 
     <span class="small">Delay (s):</span>
@@ -1278,6 +1343,14 @@ async function setDelay(){
     ws.send(JSON.stringify({type:"set_delay", delay_s:d}));
   } else {
     await apiPost('api/config/delay', {delay_s:d});
+  }
+}
+
+async function updateSelf(){
+  if(!confirm("Update script from ~/.tvphotos.yml update_url?")) return;
+  const j = await apiPost('api/update', {});
+  if(j && j.ok){
+    setStatus(`Updated script (${j.bytes} bytes)`, false);
   }
 }
 
