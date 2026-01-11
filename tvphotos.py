@@ -1643,10 +1643,9 @@ def main():
     mgr = ImageManager(folder)
     mgr.set_delay(delay)
 
-    apply_locale_from_config()
-
     hub = WebSocketHub()
     app = QApplication(sys.argv)
+    apply_locale_from_config()
     w = Slideshow(mgr, hub, delay_s=mgr.delay_s)
 
     start_server(mgr, w, hub, host="0.0.0.0", port=port)
