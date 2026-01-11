@@ -451,6 +451,9 @@ class ImageManager:
                 name = os.path.basename(p)
                 enabled = name not in self.disabled
                 fit_mode = fit_mode_from_name(name)
+                width = 0
+                height = 0
+                ratio = 0.0
                 try:
                     st = os.stat(p)
                     size = st.st_size
@@ -458,10 +461,25 @@ class ImageManager:
                 except Exception:
                     size = 0
                     mtime = 0
+                try:
+                    img = Image.open(p)
+                    img = ImageOps.exif_transpose(img)
+                    width, height = img.size
+                    if height > 0:
+                        ratio = width / height
+                except Exception:
+                    width = 0
+                    height = 0
+                    ratio = 0.0
+                fit_effective = choose_fit_mode(name, width, height)
                 out.append({
                     "name": name,
                     "enabled": enabled,
                     "fit_mode": fit_mode,
+                    "fit_effective": fit_effective,
+                    "width": width,
+                    "height": height,
+                    "ratio": ratio,
                     "size": size,
                     "mtime": mtime,
                 })
@@ -1358,6 +1376,14 @@ function fmtTime(ts){
   const d = new Date(ts*1000);
   return d.toLocaleString();
 }
+function fmtRatio(r){
+  if(!r || !isFinite(r)) return "";
+  return r.toFixed(3);
+}
+function fmtDim(w,h){
+  if(!w || !h) return "";
+  return `${w}×${h}`;
+}
 
 async function loadImages(){
   const j = await apiGet('api/images');
@@ -1392,7 +1418,30 @@ async function loadImages(){
 
     const small = document.createElement('div');
     small.className = 'small';
-    small.textContent = `${fmtBytes(it.size)} • ${fmtTime(it.mtime)}`;
+    {
+      const parts = [];
+      const sz = fmtBytes(it.size);
+      if(sz) parts.push(sz);
+      const tm = fmtTime(it.mtime);
+      if(tm) parts.push(tm);
+      const dim = fmtDim(it.width, it.height);
+      if(dim) parts.push(dim);
+      const r = fmtRatio(it.ratio);
+      if(r) parts.push(`W/H ${r}`);
+      small.textContent = parts.join(' • ');
+    }
+
+    const fitInfo = document.createElement('div');
+    fitInfo.className = 'small';
+    {
+      const tag = (it.fit_mode || 'auto');
+      const eff = (it.fit_effective || '');
+      if(tag === 'auto' && eff){
+        fitInfo.textContent = `Fit: ${eff} (auto)`;
+      } else {
+        fitInfo.textContent = `Fit: ${tag}`;
+      }
+    }
 
     const row = document.createElement('div');
     row.className = 'row';
@@ -1455,6 +1504,7 @@ async function loadImages(){
     card.appendChild(img);
     card.appendChild(meta);
     card.appendChild(small);
+    card.appendChild(fitInfo);
     card.appendChild(row);
     grid.appendChild(card);
   }
