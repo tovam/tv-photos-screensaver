@@ -12,7 +12,8 @@ import ipaddress
 import base64
 import hashlib
 import re
-import locale as pylocale
+import locale
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -115,7 +116,7 @@ def apply_locale_from_config():
 
     for cand in candidates:
         try:
-            pylocale.setlocale(pylocale.LC_TIME, cand)
+            locale.setlocale(locale.LC_TIME, cand)
             return cand
         except Exception:
             continue
@@ -760,7 +761,7 @@ class Slideshow(QWidget):
         self.clock.move(self.width() - w - self.margin, self.margin)
 
     def tick(self):
-        self.clock.setText(time.strftime("%A %d %B %Y\n%H:%M:%S"))
+        self.clock.setText(datetime.now().strftime("%A %d %B %Y\n%H:%M:%S"))
         self.layout_clock()
 
     def _show_path(self, path):
