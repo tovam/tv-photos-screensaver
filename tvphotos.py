@@ -15,8 +15,12 @@ import hashlib
 import re
 import locale
 import socket
+import select
 import secrets
 import shutil
+import atexit
+import signal
+import ctypes
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
@@ -326,11 +330,29 @@ class NavidromeClient:
         return self.base_url + "/rest/stream.view?" + urlencode(q)
 
 
+def _set_pdeathsig(sig=signal.SIGTERM):
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, sig)
+    except Exception:
+        pass
+
+
 class MPVController:
+    _cleanup_registered = False
+
     def __init__(self, socket_path=MPV_SOCKET_PATH):
         self.socket_path = socket_path
         self.proc = None
         self.lock = threading.Lock()
+        self._register_cleanup()
+
+    def _register_cleanup(self):
+        if MPVController._cleanup_registered:
+            return
+        MPVController._cleanup_registered = True
+        atexit.register(self.shutdown)
 
     def start(self):
         if self.proc and self.proc.poll() is None:
@@ -352,8 +374,14 @@ class MPVController:
             f"--cache-secs={MPV_CACHE_SECS}",
             "--quiet",
         ]
+        preexec_fn = _set_pdeathsig if sys.platform.startswith("linux") else None
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=preexec_fn,
+            )
         except Exception:
             self.proc = None
             return False
@@ -404,6 +432,31 @@ class MPVController:
         if resp and resp.get("error") == "success":
             return resp.get("data")
         return None
+
+    def shutdown(self):
+        proc = self.proc
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        finally:
+            self.proc = None
+            try:
+                if os.path.exists(self.socket_path):
+                    os.remove(self.socket_path)
+            except Exception:
+                pass
 
 
 class MusicManager:
@@ -987,12 +1040,42 @@ def choose_fit_mode(name, iw, ih):
 # WebSocket (minimal RFC6455)
 # ----------------------------
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_SEND_TIMEOUT_S = 5.0  # Bound WS sends so broadcasts cannot hang.
 
 
 def ws_make_accept(key):
     raw = (key + _WS_GUID).encode("utf-8")
     digest = hashlib.sha1(raw).digest()
     return base64.b64encode(digest).decode("ascii")
+
+
+def ws_send_all(sock, data, timeout_s=WS_SEND_TIMEOUT_S):
+    if timeout_s is None:
+        sock.sendall(data)
+        return
+
+    deadline = time.monotonic() + timeout_s
+    total = 0
+    flags = getattr(socket, "MSG_DONTWAIT", 0)
+    while total < len(data):
+        try:
+            sent = sock.send(data[total:], flags)
+        except (BlockingIOError, InterruptedError):
+            sent = None
+        if sent is None:
+            pass
+        elif sent == 0:
+            raise OSError("socket closed")
+        else:
+            total += sent
+            continue
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("ws send timeout")
+        _, writable, _ = select.select([], [sock], [], remaining)
+        if not writable:
+            raise TimeoutError("ws send timeout")
 
 
 def ws_send_text(sock, text):
@@ -1010,7 +1093,11 @@ def ws_send_text(sock, text):
         header.append(127)
         header.extend(ln.to_bytes(8, "big"))
 
-    sock.sendall(header + payload)
+    ws_send_all(sock, header + payload)
+
+
+def ws_send_pong(sock):
+    ws_send_all(sock, b"\x8A\x00")
 
 
 def ws_recv_frame(sock):
@@ -1051,8 +1138,6 @@ def ws_recv_frame(sock):
             data = bytes(data[i] ^ mask[i % 4] for i in range(len(data)))
 
         return opcode, data
-    except socket.timeout:
-        return "timeout", None
     except Exception:
         return None, None
 
@@ -1695,8 +1780,8 @@ def make_handler(mgr, slideshow, hub, music):
             self.end_headers()
 
             sock = self.connection
-            # Short timeout prevents send() from hanging forever; recv timeout is treated as idle.
-            sock.settimeout(5)
+            # Keep WS open indefinitely; browser may be idle for long periods.
+            sock.settimeout(None)
             hub.add(sock)
 
             init = {
@@ -1718,15 +1803,13 @@ def make_handler(mgr, slideshow, hub, music):
             try:
                 while True:
                     opcode, payload = ws_recv_frame(sock)
-                    if opcode == "timeout":
-                        continue
                     if opcode is None:
                         break
                     if opcode == 0x8:
                         break
                     if opcode == 0x9:
                         try:
-                            sock.sendall(b"\x8A\x00")
+                            ws_send_pong(sock)
                         except Exception:
                             break
                         continue
