@@ -58,6 +58,7 @@ NAVIDROME_API_VERSION = "1.16.1"
 NAVIDROME_CLIENT_NAME = "tvphotos"
 NAVIDROME_RANDOM_SIZE = 50
 MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
+MPV_CACHE_SECS = 30
 
 
 def is_allowed_client_ip(ip_str):
@@ -347,6 +348,8 @@ class MPVController:
             "--idle=yes",
             "--force-window=no",
             "--input-ipc-server=" + self.socket_path,
+            "--cache=yes",
+            f"--cache-secs={MPV_CACHE_SECS}",
             "--quiet",
         ]
         try:
@@ -491,6 +494,10 @@ class MusicManager:
             queue = list(self.queue)
 
         if source == "playlist" and playlist_id:
+            if not playlist_entries:
+                return None
+            if playlist_idx < 0 or playlist_idx >= len(playlist_entries):
+                playlist_idx = 0
             for i in range(playlist_idx, len(playlist_entries)):
                 song = playlist_entries[i]
                 if not song or not isinstance(song, dict):
@@ -515,6 +522,25 @@ class MusicManager:
             return ""
         return self._build_label(track)
 
+    def _progress_bar(self, pos, dur, width=16):
+        if pos is None or dur is None or dur <= 0:
+            return ""
+        try:
+            ratio = float(pos) / float(dur)
+        except Exception:
+            return ""
+        if ratio < 0:
+            ratio = 0
+        if ratio > 1:
+            ratio = 1
+        filled = int(round(ratio * width))
+        if filled < 0:
+            filled = 0
+        if filled > width:
+            filled = width
+        bar = "=" * filled + "-" * (width - filled)
+        return f"[{bar}]"
+
     def _compose_ui_text(self):
         with self.lock:
             current = self.current
@@ -537,27 +563,34 @@ class MusicManager:
         elif pos_txt:
             time_text = pos_txt
 
-        top_line = (label or "").strip()
-        if time_text:
-            if top_line:
-                top_line = f"{top_line} {time_text}"
-            else:
-                top_line = time_text
+        bar_text = self._progress_bar(pos, dur, width=16)
 
+        top_line = (label or "").strip()
         next_label = self._next_label()
-        if not top_line and not next_label:
+        if not top_line and not (time_text or bar_text) and not next_label:
             return ""
 
-        top_html = html.escape(top_line) if top_line else ""
+        parts = []
+        if top_line:
+            parts.append(f"<div>{html.escape(top_line)}</div>")
+        if time_text or bar_text:
+            bar_html = html.escape(bar_text) if bar_text else ""
+            time_html = html.escape(time_text) if time_text else ""
+            chunks = []
+            if bar_html:
+                chunks.append(f"<span style='font-family: DejaVu Sans Mono;'>"
+                              f"{bar_html}</span>")
+            if time_html:
+                chunks.append(f"<span>{time_html}</span>")
+            parts.append(
+                "<div style=\"font-size:12pt; opacity:0.9;\">"
+                + " ".join(chunks) +
+                "</div>"
+            )
         if next_label:
             next_html = html.escape(f"Next: {next_label}")
-            if top_html:
-                return (
-                    f"<div>{top_html}</div>"
-                    f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>"
-                )
-            return f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>"
-        return top_html
+            parts.append(f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>")
+        return "".join(parts)
 
     def _refresh_ui(self):
         text = self._compose_ui_text()
@@ -590,7 +623,7 @@ class MusicManager:
         if artist.lower() == "unknown artist":
             artist = ""
         if title and artist:
-            return f"{title} -- {artist}"
+            return f"{title} — {artist}"
         return title or artist
 
     def _song_label(self, song):
@@ -1622,7 +1655,8 @@ def make_handler(mgr, slideshow, hub, music):
             self.end_headers()
 
             sock = self.connection
-            sock.settimeout(60)
+            # Keep WS open indefinitely; browser may be idle for long periods.
+            sock.settimeout(None)
             hub.add(sock)
 
             init = {
@@ -2205,7 +2239,7 @@ function setMusicNow(track, label){
     const t = (track.title || '').trim();
     let a = (track.artist || '').trim();
     if(a.toLowerCase() === 'unknown artist') a = '';
-    text = (t && a) ? `${t} -- ${a}` : (t || a);
+    text = (t && a) ? `${t} — ${a}` : (t || a);
   }
   if(text){
     el.textContent = text;
