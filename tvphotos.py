@@ -32,7 +32,7 @@ from PIL.ImageQt import ImageQt
 
 from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot
 from PyQt6.QtGui import QPixmap, QFont, QKeySequence, QShortcut
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect, QProgressBar
 
 
 # ----------------------------
@@ -426,6 +426,7 @@ class MusicManager:
         self.playlist_entries = []
         self.playlist_idx = 0
         self._last_ui_text = ""
+        self._last_ui_progress = -1
 
         cfg = read_navidrome_config()
         if not cfg:
@@ -447,6 +448,15 @@ class MusicManager:
         try:
             QMetaObject.invokeMethod(self.slideshow, "set_music_text",
                 Qt.ConnectionType.QueuedConnection, Q_ARG(str, text))
+        except Exception:
+            pass
+
+    def _set_ui_progress(self, value):
+        if not self.slideshow:
+            return
+        try:
+            QMetaObject.invokeMethod(self.slideshow, "set_music_progress",
+                Qt.ConnectionType.QueuedConnection, Q_ARG(int, int(value)))
         except Exception:
             pass
 
@@ -485,6 +495,17 @@ class MusicManager:
             pos = 0
         return pos, dur
 
+    def _progress_value(self):
+        pos, dur = self._playback_times()
+        if pos is None or dur is None or dur <= 0:
+            return None
+        ratio = pos / dur
+        if ratio < 0:
+            ratio = 0
+        if ratio > 1:
+            ratio = 1
+        return int(round(ratio * 1000))
+
     def _peek_next_track(self):
         with self.lock:
             source = self.source
@@ -522,25 +543,6 @@ class MusicManager:
             return ""
         return self._build_label(track)
 
-    def _progress_bar(self, pos, dur, width=16):
-        if pos is None or dur is None or dur <= 0:
-            return ""
-        try:
-            ratio = float(pos) / float(dur)
-        except Exception:
-            return ""
-        if ratio < 0:
-            ratio = 0
-        if ratio > 1:
-            ratio = 1
-        filled = int(round(ratio * width))
-        if filled < 0:
-            filled = 0
-        if filled > width:
-            filled = width
-        bar = "=" * filled + "-" * (width - filled)
-        return f"[{bar}]"
-
     def _compose_ui_text(self):
         with self.lock:
             current = self.current
@@ -563,30 +565,17 @@ class MusicManager:
         elif pos_txt:
             time_text = pos_txt
 
-        bar_text = self._progress_bar(pos, dur, width=16)
-
         top_line = (label or "").strip()
         next_label = self._next_label()
-        if not top_line and not (time_text or bar_text) and not next_label:
+        if not top_line and not time_text and not next_label:
             return ""
 
         parts = []
         if top_line:
             parts.append(f"<div>{html.escape(top_line)}</div>")
-        if time_text or bar_text:
-            bar_html = html.escape(bar_text) if bar_text else ""
-            time_html = html.escape(time_text) if time_text else ""
-            chunks = []
-            if bar_html:
-                chunks.append(f"<span style='font-family: DejaVu Sans Mono;'>"
-                              f"{bar_html}</span>")
-            if time_html:
-                chunks.append(f"<span>{time_html}</span>")
-            parts.append(
-                "<div style=\"font-size:12pt; opacity:0.9;\">"
-                + " ".join(chunks) +
-                "</div>"
-            )
+        if time_text:
+            time_html = html.escape(time_text)
+            parts.append(f"<div style=\"font-size:12pt; opacity:0.9;\">{time_html}</div>")
         if next_label:
             next_html = html.escape(f"Next: {next_label}")
             parts.append(f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>")
@@ -597,6 +586,11 @@ class MusicManager:
         if text != self._last_ui_text:
             self._last_ui_text = text
             self._set_ui_text(text)
+        progress = self._progress_value() if self.current else None
+        progress_int = -1 if progress is None else progress
+        if progress_int != self._last_ui_progress:
+            self._last_ui_progress = progress_int
+            self._set_ui_progress(progress_int)
 
     def _broadcast(self):
         if not self.hub:
@@ -1057,6 +1051,8 @@ def ws_recv_frame(sock):
             data = bytes(data[i] ^ mask[i % 4] for i in range(len(data)))
 
         return opcode, data
+    except socket.timeout:
+        return "timeout", None
     except Exception:
         return None, None
 
@@ -1377,6 +1373,29 @@ class Slideshow(QWidget):
         self.music.setGraphicsEffect(music_shadow)
         self.music.hide()
 
+        self.music_bar = QProgressBar(self)
+        self.music_bar.setRange(0, 1000)
+        self.music_bar.setValue(0)
+        self.music_bar.setTextVisible(False)
+        self.music_bar.setFixedHeight(10)
+        self.music_bar.setStyleSheet(
+            "QProgressBar {"
+            "  border: 1px solid rgba(255,255,255,0.12);"
+            "  background-color: rgba(0,0,0,0.35);"
+            "  border-radius: 6px;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background-color: rgba(255,255,255,200);"
+            "  border-radius: 5px;"
+            "}"
+        )
+        bar_shadow = QGraphicsDropShadowEffect(self)
+        bar_shadow.setBlurRadius(16)
+        bar_shadow.setOffset(0, 2)
+        bar_shadow.setColor(Qt.GlobalColor.black)
+        self.music_bar.setGraphicsEffect(bar_shadow)
+        self.music_bar.hide()
+
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
         QShortcut(QKeySequence("Space"), self, activated=self.show_next)
@@ -1455,7 +1474,16 @@ class Slideshow(QWidget):
         if self.music.isVisible():
             self.music.adjustSize()
             mh = self.music.height()
-            self.music.move(self.margin, self.height() - mh - self.margin)
+            gap = 6
+            bar_visible = self.music_bar.isVisible()
+            bar_h = self.music_bar.height() if bar_visible else 0
+            total_h = mh + (gap + bar_h if bar_visible else 0)
+            y = self.height() - total_h - self.margin
+            self.music.move(self.margin, y)
+            if bar_visible:
+                bar_w = max(220, self.music.width())
+                self.music_bar.setFixedWidth(bar_w)
+                self.music_bar.move(self.margin, y + mh + gap)
 
     @pyqtSlot(str)
     def set_music_text(self, text):
@@ -1465,6 +1493,18 @@ class Slideshow(QWidget):
             self.music.show()
         else:
             self.music.hide()
+            self.music_bar.hide()
+        self.layout_clock()
+
+    @pyqtSlot(int)
+    def set_music_progress(self, value):
+        if value is None or value < 0:
+            self.music_bar.hide()
+        else:
+            if value > 1000:
+                value = 1000
+            self.music_bar.setValue(int(value))
+            self.music_bar.show()
         self.layout_clock()
 
     def tick(self):
@@ -1655,8 +1695,8 @@ def make_handler(mgr, slideshow, hub, music):
             self.end_headers()
 
             sock = self.connection
-            # Keep WS open indefinitely; browser may be idle for long periods.
-            sock.settimeout(None)
+            # Short timeout prevents send() from hanging forever; recv timeout is treated as idle.
+            sock.settimeout(5)
             hub.add(sock)
 
             init = {
@@ -1678,6 +1718,8 @@ def make_handler(mgr, slideshow, hub, music):
             try:
                 while True:
                     opcode, payload = ws_recv_frame(sock)
+                    if opcode == "timeout":
+                        continue
                     if opcode is None:
                         break
                     if opcode == 0x8:
