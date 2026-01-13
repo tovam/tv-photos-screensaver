@@ -21,6 +21,8 @@ import shutil
 import atexit
 import signal
 import ctypes
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, urlencode
@@ -473,6 +475,9 @@ class MusicManager:
         self.queue = []
         self.current = None
         self.paused = False
+        self.history = []
+        self._override_next = None
+        self._suppress_history_once = False
         self.volume = 70
         self.label = ""
         self.source = "random"
@@ -684,6 +689,10 @@ class MusicManager:
 
     def _next_song(self):
         with self.lock:
+            if self._override_next:
+                song = dict(self._override_next)
+                self._override_next = None
+                return song
             if self.source == "playlist" and self.playlist_id:
                 playlist_id = self.playlist_id
                 playlist_entries = list(self.playlist_entries)
@@ -742,6 +751,13 @@ class MusicManager:
         self.mpv.load(url)
         self.mpv.set_pause(False)
         with self.lock:
+            prev = self.current
+            suppress_history = self._suppress_history_once
+            self._suppress_history_once = False
+            if not suppress_history and prev:
+                self.history.append(dict(prev))
+                if len(self.history) > 100:
+                    self.history = self.history[-100:]
             self.current = track
             self.paused = False
         self._song_label(track)
@@ -827,6 +843,9 @@ class MusicManager:
             self.queue = []
             self.current = None
             self.paused = False
+            self.history = []
+            self._override_next = None
+            self._suppress_history_once = False
         self.mpv.stop()
         self._broadcast()
         return self.state()
@@ -843,6 +862,9 @@ class MusicManager:
             self.queue = []
             self.current = None
             self.paused = False
+            self.history = []
+            self._override_next = None
+            self._suppress_history_once = False
         self.mpv.stop()
         self._broadcast()
         return self.state()
@@ -872,6 +894,44 @@ class MusicManager:
         with self.lock:
             self.paused = False
         self.mpv.set_pause(False)
+        self._broadcast()
+        return self.state()
+
+    def previous(self):
+        if not self.enabled:
+            return self.state()
+        with self.lock:
+            target = None
+            if self.history:
+                target = self.history.pop()
+                if self.source == "playlist" and self.playlist_id and self.playlist_entries:
+                    target_id = str(target.get("id"))
+                    idx = None
+                    for i, song in enumerate(self.playlist_entries):
+                        sid = song.get("id")
+                        if sid is None:
+                            continue
+                        if str(sid) == target_id:
+                            idx = i
+                            break
+                    if idx is not None:
+                        self.playlist_idx = idx + 1
+                    else:
+                        self.playlist_idx = max(0, int(self.playlist_idx) - 2)
+            elif self.source == "playlist" and self.playlist_id and self.playlist_entries:
+                self.playlist_idx = max(0, int(self.playlist_idx) - 2)
+            elif self.current:
+                target = dict(self.current)
+            else:
+                return self.state()
+
+            if target is not None:
+                self._override_next = dict(target)
+                self._suppress_history_once = True
+            self.current = None
+            self.paused = False
+
+        self.mpv.stop()
         self._broadcast()
         return self.state()
 
@@ -1389,6 +1449,209 @@ class ImageManager:
 # ----------------------------
 # CEC helpers
 # ----------------------------
+@dataclass(frozen=True)
+class CecKeyEvent:
+    """Represents one recognized CEC key DOWN event."""
+    name: str
+    code: int
+    initiator: int
+    destination: int
+    raw: str
+
+
+class CecKeyListener:
+    """
+    Listener that:
+      - periodically asserts playback device name via cec-ctl
+      - reads cec-client stdout line-by-line
+      - parses key DOWN events and dispatches to callback
+    """
+
+    _TRAFFIC_RE = re.compile(
+        r"TRAFFIC:.*>>\s+"
+        r"(?P<hdr>[0-9a-fA-F]{2})"
+        r"(?::(?P<op>[0-9a-fA-F]{2}))?"
+        r"(?::(?P<param>[0-9a-fA-F]{2}))?"
+        r"\s*$"
+    )
+
+    _OP_USER_CONTROL_PRESSED = 0x44
+    _OP_USER_CONTROL_RELEASED = 0x45
+
+    _KEYS: Dict[int, str] = {
+        0x00: "SELECT",
+        0x01: "UP",
+        0x02: "DOWN",
+        0x03: "LEFT",
+        0x04: "RIGHT",
+        0x0D: "EXIT",
+        0x44: "PAUSE",
+        0x45: "STOP",
+        0x46: "PAUSE",
+        0x48: "REWIND",
+        0x49: "FAST_FORWARD",
+        0x4B: "FORWARD",
+        0x4C: "BACKWARD",
+    }
+
+    def __init__(
+        self,
+        callback: Callable[[CecKeyEvent], None],
+        *,
+        cec_device: str = "/dev/cec0",
+        refresh_interval_s: float = 30.0,
+        process_nice: bool = True,
+    ):
+        self._cb = callback
+        self._cec_device = cec_device
+        self._refresh_interval_s = float(refresh_interval_s)
+        self._process_nice = process_nice
+
+        self._stop = threading.Event()
+        self._reader_thread: Optional[threading.Thread] = None
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._proc: Optional[subprocess.Popen] = None
+
+    def start(self):
+        self._stop.clear()
+        self._run_cec_ctl()
+        self._start_cec_client()
+
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name="cec-reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            name="cec-refresh",
+            daemon=True,
+        )
+        self._refresh_thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=2.0)
+
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+
+    def join(self):
+        try:
+            while not self._stop.is_set():
+                time.sleep(0.2)
+        except KeyboardInterrupt:
+            self.stop()
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+
+    def _run_cec_ctl(self):
+        cmd = ["cec-ctl", "-d", self._cec_device, "--playback", "-S", "-o", "raspberry"]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    def _refresh_loop(self):
+        interval = max(1.0, self._refresh_interval_s)
+        while not self._stop.wait(interval):
+            self._run_cec_ctl()
+
+    def _start_cec_client(self):
+        base_cmd = ["cec-client", self._cec_device]
+        if self._process_nice:
+            cmd = ["nice", "-n", "10"] + base_cmd
+        else:
+            cmd = base_cmd
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    def _reader_loop(self):
+        if not self._proc or not self._proc.stdout:
+            self._stop.set()
+            return
+
+        for line in self._proc.stdout:
+            if self._stop.is_set():
+                break
+
+            evt = self._parse_line(line)
+            if evt is None:
+                continue
+
+            try:
+                self._cb(evt)
+            except Exception:
+                pass
+
+        self._stop.set()
+
+    def _parse_line(self, line: str) -> Optional[CecKeyEvent]:
+        m = self._TRAFFIC_RE.search(line)
+        if not m:
+            return None
+
+        hdr_s = m.group("hdr")
+        op_s = m.group("op")
+        param_s = m.group("param")
+
+        if not hdr_s or not op_s:
+            return None
+
+        hdr = int(hdr_s, 16)
+        op = int(op_s, 16)
+
+        if op != self._OP_USER_CONTROL_PRESSED:
+            return None
+
+        if not param_s:
+            return None
+
+        key_code = int(param_s, 16)
+        key_name = self._KEYS.get(key_code)
+        if key_name is None:
+            return None
+
+        initiator = (hdr >> 4) & 0xF
+        destination = hdr & 0xF
+
+        return CecKeyEvent(
+            name=key_name,
+            code=key_code,
+            initiator=initiator,
+            destination=destination,
+            raw=line.rstrip("\n"),
+        )
+
+
 def run_cec(args):
     cmd = ["cec-ctl", "-d", "/dev/cec0"] + args
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -1399,6 +1662,26 @@ def run_cec(args):
         "stderr": p.stderr[-4000:],
         "cmd": " ".join(cmd),
     }
+
+
+def start_cec_key_listener(music):
+    if not music or not music.enabled:
+        return None
+
+    def on_key(evt: CecKeyEvent):
+        if evt.name == "PAUSE":
+            music.toggle_pause()
+        elif evt.name == "FORWARD":
+            music.next()
+        elif evt.name == "BACKWARD":
+            music.previous()
+
+    try:
+        listener = CecKeyListener(on_key, refresh_interval_s=30)
+        listener.start()
+        return listener
+    except Exception:
+        return None
 
 
 # ----------------------------
@@ -2899,6 +3182,13 @@ def main():
     apply_locale_from_config()
     w = Slideshow(mgr, hub, delay_s=mgr.delay_s)
     music = MusicManager(hub, w)
+    cec_listener = start_cec_key_listener(music)
+    if cec_listener:
+        atexit.register(cec_listener.stop)
+        try:
+            app.aboutToQuit.connect(cec_listener.stop)
+        except Exception:
+            pass
 
     start_server(mgr, w, hub, music, host="0.0.0.0", port=port)
 
