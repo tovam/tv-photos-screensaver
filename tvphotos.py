@@ -400,6 +400,7 @@ class MusicManager:
         self.current = None
         self.paused = False
         self.volume = 70
+        self.label = ""
 
         cfg = read_navidrome_config()
         if not cfg:
@@ -433,17 +434,27 @@ class MusicManager:
                 "track": self.current,
                 "paused": self.paused,
                 "volume": self.volume,
+                "label": self.label,
             }
         self.hub.broadcast(payload)
 
-    def _song_label(self, song):
+    def _build_label(self, song):
         if not song:
             return ""
-        title = song.get("title") or ""
-        artist = song.get("artist") or ""
-        if artist and title:
-            return f"{artist} - {title}"
+        title = (song.get("title") or "").strip()
+        artist = (song.get("artist") or "").strip()
+        if artist.lower() == "unknown artist":
+            artist = ""
+        if title and artist:
+            return f"{title} -- {artist}"
         return title or artist
+
+    def _song_label(self, song):
+        label = self._build_label(song)
+        with self.lock:
+            if label:
+                self.label = label
+            return self.label
 
     def _next_song(self):
         with self.lock:
@@ -508,6 +519,7 @@ class MusicManager:
                 "track": self.current,
                 "paused": self.paused,
                 "volume": self.volume,
+                "label": self.label,
             }
 
     def toggle_pause(self):
@@ -1810,10 +1822,8 @@ function connectWS(){
         if(typeof msg.volume === "number"){
           document.getElementById("musicVol").value = msg.volume;
         }
-        if(msg.track){
-          setMusicNow(msg.track);
-        } else {
-          setMusicNow(null);
+        if(msg.track || msg.label){
+          setMusicNow(msg.track || null, msg.label || "");
         }
       }
     };
@@ -1896,28 +1906,32 @@ function fmtDim(w,h){
   return `${w}×${h}`;
 }
 
-function setMusicNow(track){
+function setMusicNow(track, label){
   const el = document.getElementById('musicNow');
   if(!el) return;
-  if(track && (track.title || track.artist)){
-    const t = track.title || '';
-    const a = track.artist || '';
-    el.textContent = a && t ? `${a} - ${t}` : (t || a);
-  } else {
-    el.textContent = '';
+  let text = '';
+  if(typeof label === 'string' && label.trim()){
+    text = label.trim();
+  } else if(track && (track.title || track.artist)){
+    const t = (track.title || '').trim();
+    let a = (track.artist || '').trim();
+    if(a.toLowerCase() === 'unknown artist') a = '';
+    text = (t && a) ? `${t} -- ${a}` : (t || a);
+  }
+  if(text){
+    el.textContent = text;
   }
 }
 
 async function musicState(){
   const j = await apiGet('api/music/state');
   if(!j || j.ok === false){
-    setMusicNow(null);
     return;
   }
   if(typeof j.volume === "number"){
     document.getElementById("musicVol").value = j.volume;
   }
-  setMusicNow(j.track || null);
+  setMusicNow(j.track || null, j.label || "");
 }
 
 async function musicToggle(){
