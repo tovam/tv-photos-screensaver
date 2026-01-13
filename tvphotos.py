@@ -1736,19 +1736,25 @@ def make_handler(mgr, slideshow, hub, music):
         def log_message(self, fmt, *args):
             return
 
-        def _deny(self, code=403, msg="Forbidden"):
+        def _deny(self, code=403, msg="Forbidden", close=False):
             data = msg.encode("utf-8", errors="ignore")
             self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(data)
 
-        def _json(self, obj, code=200):
+        def _json(self, obj, code=200, close=False):
             data = json.dumps(obj).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            if close:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self.end_headers()
             self.wfile.write(data)
 
@@ -1917,7 +1923,7 @@ def make_handler(mgr, slideshow, hub, music):
 
         def do_POST(self):
             if not self._client_ok():
-                return self._deny()
+                return self._deny(close=True)
 
             u = urlparse(self.path)
             route = strip_to_known_route(u.path)
@@ -1929,9 +1935,9 @@ def make_handler(mgr, slideshow, hub, music):
                 except Exception:
                     n = 0
                 if n <= 0:
-                    return self._json({"ok": False, "error": "empty upload"}, 400)
+                    return self._json({"ok": False, "error": "empty upload"}, 400, close=True)
                 if n > MAX_UPLOAD_BYTES:
-                    return self._json({"ok": False, "error": "upload too large"}, 413)
+                    return self._json({"ok": False, "error": "upload too large"}, 413, close=True)
 
                 ctype = self.headers.get("Content-Type", "")
                 body = self.rfile.read(n)
