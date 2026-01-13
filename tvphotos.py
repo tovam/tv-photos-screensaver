@@ -63,6 +63,7 @@ NAVIDROME_CLIENT_NAME = "tvphotos"
 NAVIDROME_RANDOM_SIZE = 50
 MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
 MPV_CACHE_SECS = 30
+MPV_VOLUME_MAX = 200
 
 
 def is_allowed_client_ip(ip_str):
@@ -372,6 +373,7 @@ class MPVController:
             "--input-ipc-server=" + self.socket_path,
             "--cache=yes",
             f"--cache-secs={MPV_CACHE_SECS}",
+            f"--volume-max={MPV_VOLUME_MAX}",
             "--quiet",
         ]
         preexec_fn = _set_pdeathsig if sys.platform.startswith("linux") else None
@@ -892,8 +894,8 @@ class MusicManager:
             v = self.volume
         if v < 0:
             v = 0
-        if v > 100:
-            v = 100
+        if v > MPV_VOLUME_MAX:
+            v = MPV_VOLUME_MAX
         with self.lock:
             self.volume = v
         self.mpv.set_volume(v)
@@ -2100,43 +2102,210 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>fehb</title>
   <style>
-    body { font-family: sans-serif; margin: 16px; background: #111; color: #eee; }
-    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    button { padding: 8px 10px; border: 0; border-radius: 8px; cursor: pointer; }
-    button.primary { background: #3b82f6; color: #fff; }
-    button.danger { background: #ef4444; color: #fff; }
-    button.gray { background: #333; color: #eee; }
-    input, select { padding: 7px 8px; border-radius: 10px; border: 1px solid #333; background:#0f0f0f; color:#eee; }
+    :root {
+      --bg0: #0a0f14;
+      --bg1: #0f172a;
+      --bg2: #0b1b22;
+      --panel: #121922;
+      --panel-2: #0f141b;
+      --border: rgba(148,163,184,0.14);
+      --muted: #94a3b8;
+      --text: #e5e7eb;
+      --accent: #f97316;
+      --accent-2: #22d3ee;
+      --accent-3: #22c55e;
+      --danger: #ef4444;
+      --shadow: 0 12px 30px rgba(0,0,0,0.45);
+      --radius: 16px;
+    }
+
+    body {
+      font-family: "Space Grotesk", "Figtree", "Avenir Next", "Segoe UI", sans-serif;
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(1000px 500px at 10% -10%, rgba(34,211,238,0.18), transparent 60%),
+        radial-gradient(800px 500px at 110% 10%, rgba(249,115,22,0.18), transparent 55%),
+        linear-gradient(180deg, var(--bg1), var(--bg0) 45%, #070a0f 100%);
+      min-height: 100vh;
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background-image: radial-gradient(rgba(255,255,255,0.05) 1px, transparent 1px);
+      background-size: 26px 26px;
+      opacity: 0.2;
+      pointer-events: none;
+    }
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(600px 300px at 70% 80%, rgba(34,197,94,0.1), transparent 70%);
+      pointer-events: none;
+    }
+    .page { padding: 22px; max-width: 1480px; margin: 0 auto; position: relative; z-index: 1; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button {
+      padding: 10px 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      cursor: pointer;
+      color: #e2e8f0;
+      background: linear-gradient(135deg, rgba(255,255,255,0.04), rgba(255,255,255,0.01));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      font-weight: 600;
+      letter-spacing: 0.2px;
+      transition: transform 120ms ease, box-shadow 120ms ease, background 120ms ease;
+    }
+    button:hover { transform: translateY(-1px); box-shadow: 0 10px 16px rgba(0,0,0,0.35); }
+    button:active { transform: translateY(0); }
+    button.primary { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #0b1118; border-color: rgba(255,255,255,0.2); }
+    button.danger { background: linear-gradient(135deg, #ef4444, #f97316); color: #0b1118; border-color: rgba(255,255,255,0.2); }
+    button.gray { background: linear-gradient(135deg, #1c2430, #121821); color: #e2e8f0; }
+    input, select {
+      padding: 8px 10px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: #0b1118;
+      color: #e2e8f0;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+    }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
-    .card { background: #1b1b1b; border-radius: 14px; padding: 10px; box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset; }
-    .card.current { outline: 2px solid rgba(59,130,246,0.9); }
-    .thumb { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 10px; object-fit: cover; display: block; }
-    .meta { margin-top: 8px; font-size: 14px; opacity: 0.9; word-break: break-all; }
-    .small { font-size: 12px; opacity: 0.7; }
+    .card { background: linear-gradient(180deg, #141b24, #0f141b); border-radius: 16px; padding: 10px; box-shadow: 0 0 0 1px rgba(255,255,255,0.06) inset, var(--shadow); }
+    .card.current { outline: 2px solid rgba(34,211,238,0.7); }
+    .thumb { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 12px; object-fit: cover; display: block; }
+    .meta { margin-top: 8px; font-size: 14px; opacity: 0.95; word-break: break-all; }
+    .small { font-size: 12px; opacity: 0.78; }
+    .muted { font-size: 12px; opacity: 0.75; }
     label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
     input[type="checkbox"] { transform: scale(1.2); }
 
-    /* Current thumbnail (top-right) */
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+      padding: 18px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, rgba(20,30,40,0.95), rgba(10,15,22,0.95));
+      border: 1px solid rgba(255,255,255,0.08);
+      margin-bottom: 18px;
+      box-shadow: var(--shadow);
+      animation: rise 0.6s ease-out;
+    }
+    .title { font-size: 28px; font-weight: 700; letter-spacing: 0.4px; }
+    .meta-line { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .status-line { margin-top: 6px; font-size: 12px; color: var(--muted); }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: rgba(15,23,42,0.8);
+      border: 1px solid rgba(148,163,184,0.2);
+      color: #cbd5e1;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .pill.bad { background: rgba(127,29,29,0.4); border-color: rgba(239,68,68,0.6); color: #fecaca; }
+    .pill.ok { background: rgba(20,83,45,0.4); border-color: rgba(34,197,94,0.6); color: #bbf7d0; }
+
+    .control-deck {
+      margin-bottom: 18px;
+      padding: 16px;
+      border-radius: 18px;
+      background: linear-gradient(160deg, rgba(12,17,24,0.9), rgba(8,12,18,0.95));
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: var(--shadow);
+      animation: rise 0.6s ease-out 0.1s both;
+    }
+    .deck-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 14px;
+    }
+    .deck-title { font-size: 20px; font-weight: 700; letter-spacing: 0.3px; }
+    .deck-sub { font-size: 12px; color: var(--muted); }
+    .deck-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .panel {
+      padding: 14px;
+      border-radius: 16px;
+      background: linear-gradient(180deg, rgba(18,25,34,0.98), rgba(12,16,22,0.95));
+      border: 1px solid rgba(148,163,184,0.18);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      animation: rise 0.5s ease-out both;
+    }
+    .panel:nth-child(2) { animation-delay: 0.12s; }
+    .panel:nth-child(3) { animation-delay: 0.22s; }
+    .panel-title {
+      font-size: 11px;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: #93c5fd;
+      margin-bottom: 8px;
+    }
+    .panel-body { display: flex; flex-direction: column; gap: 10px; }
+    .field-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,0.2);
+      background: rgba(15,23,42,0.7);
+      color: #e2e8f0;
+    }
+    #musicNow { max-width: 220px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    .thumb-stack { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
     #currentThumbWrap {
-      position: fixed;
-      top: 12px;
-      right: 12px;
-      width: 180px;
+      width: 210px;
       aspect-ratio: 16/9;
       border-radius: 12px;
       overflow: hidden;
       box-shadow: 0 10px 30px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.10) inset;
-      background: #000;
-      z-index: 9999;
-      display: none;
-      opacity: 0.5;
-      pointer-events: none;
+      background: #0a0a0a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     #currentThumb {
       width: 100%;
       height: 100%;
       object-fit: cover;
-      display: block;
+      display: none;
+    }
+    #currentThumbWrap.has-current #currentThumb { display: block; }
+    #currentThumbWrap.has-current .thumb-placeholder { display: none; }
+    .thumb-placeholder { font-size: 11px; opacity: 0.6; text-transform: uppercase; letter-spacing: 1px; }
+
+    .section-title { font-size: 18px; letter-spacing: 0.4px; margin: 12px 0 6px; }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    @media (max-width: 1100px) {
+      .deck-grid { grid-template-columns: 1fr; }
+      .deck-head { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 820px) {
+      .topbar { grid-template-columns: 1fr; }
+      .thumb-stack { align-items: flex-start; }
+      #currentThumbWrap { width: min(320px, 100%); }
     }
 
     /* Hide file inputs but keep them accessible */
@@ -2144,62 +2313,103 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <div id="currentThumbWrap" title="Currently showing">
-    <img id="currentThumb" alt="current thumbnail">
-  </div>
+  <div class="page">
+    <header class="topbar">
+      <div>
+        <div class="title">fehb control</div>
+        <div class="meta-line">
+          <span id="wsStatus" class="pill">WS: connecting</span>
+          <span id="folderInfo" class="muted">Folder: --</span>
+          <span id="currentName" class="muted">Current: --</span>
+        </div>
+        <div id="status" class="status-line">Ready</div>
+      </div>
+      <div class="thumb-stack">
+        <div id="currentThumbWrap" title="Currently showing">
+          <div id="currentThumbPlaceholder" class="thumb-placeholder">No image</div>
+          <img id="currentThumb" alt="current thumbnail">
+        </div>
+        <div id="currentThumbLabel" class="small">Currently showing</div>
+      </div>
+    </header>
 
-  <h2 style="margin:0 0 18px 0;">fehb control</h2> <!-- more margin below -->
+  <section class="control-deck">
+    <div class="deck-head">
+      <div>
+        <div class="deck-title">Control deck</div>
+        <div class="deck-sub">Fast actions for images, CEC, and music.</div>
+      </div>
+      <div class="row">
+        <span class="chip">Local control</span>
+        <span class="chip">Live session</span>
+      </div>
+    </div>
+    <div class="deck-grid">
+      <div class="panel">
+        <div class="panel-title">Images</div>
+        <div class="panel-body">
+          <div class="row">
+            <button class="primary" onclick="apiPost('api/slideshow/next', {})">Next image</button>
+            <button class="gray" onclick="apiPost('api/images/refresh', {})">Refresh list</button>
+            <button class="gray" onclick="updateSelf()">Update</button>
+            <button class="primary" onclick="apiPost('api/picsum', {})">Download picsum 1920×1080</button>
+          </div>
+          <div class="row">
+            <span class="field-label">Delay (s)</span>
+            <input id="delay" type="number" min="1" max="86400" value="15" style="width:90px;">
+            <button class="gray" onclick="setDelay()">Apply</button>
+          </div>
 
-  <div class="row" style="margin-bottom:10px;">
-    <button class="primary" onclick="apiPost('api/slideshow/next', {})">Next image</button>
-    <button class="gray" onclick="apiPost('api/images/refresh', {})">Refresh list</button>
-    <button class="gray" onclick="updateSelf()">Update</button>
-    <button class="primary" onclick="apiPost('api/picsum', {})">Download picsum 1920×1080</button>
+          <!-- Mobile-friendly upload choice -->
+          <input id="filePick" class="hiddenFile" type="file" accept="image/*">
+          <input id="fileCam"  class="hiddenFile" type="file" accept="image/*" capture="environment">
 
-    <span class="small">Delay (s):</span>
-    <input id="delay" type="number" min="1" max="86400" value="15" style="width:90px;">
-    <button class="gray" onclick="setDelay()">Apply</button>
+          <div class="row">
+            <button class="primary" onclick="document.getElementById('fileCam').click()">Take photo</button>
+            <button class="primary" onclick="document.getElementById('filePick').click()">Choose file</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">CEC</div>
+        <div class="panel-body">
+          <div class="row">
+            <button class="gray" onclick="apiPost('api/cec/playback', {})">Playback (-S)</button>
+            <button class="gray" onclick="apiPost('api/cec/image_view_on', {})">Image View On</button>
+            <button class="danger" onclick="apiPost('api/cec/standby', {})">Standby (TV)</button>
+          </div>
+          <div class="row">
+            <span class="field-label">Active-source x</span>
+            <input id="asx" type="number" min="0" max="15" value="2" style="width:70px;">
+            <button class="gray" onclick="setActiveSource()">Set active source</button>
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Music</div>
+        <div class="panel-body">
+          <div class="row">
+            <button class="primary" onclick="musicToggle()">Play/Pause</button>
+            <button class="gray" onclick="musicNext()">Next</button>
+            <span class="field-label">Volume</span>
+            <input id="musicVol" type="number" min="0" max="200" value="70" style="width:70px;">
+            <button class="gray" onclick="setMusicVolume()">Set</button>
+            <span id="musicNow" class="chip"></span>
+          </div>
+          <div class="row">
+            <span class="field-label">Playlist</span>
+            <select id="playlistSel" style="min-width:220px;"></select>
+            <button class="gray" onclick="playlistStart()">Run playlist</button>
+            <button class="gray" onclick="playlistClear()">Random</button>
+            <button class="gray" onclick="loadPlaylists()">Refresh playlists</button>
+            <span id="playlistStatus" class="small"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
 
-    <span style="flex:1 1 auto;"></span>
-
-    <!-- Mobile-friendly upload choice -->
-    <input id="filePick" class="hiddenFile" type="file" accept="image/*">
-    <input id="fileCam"  class="hiddenFile" type="file" accept="image/*" capture="environment">
-
-    <button class="primary" onclick="document.getElementById('fileCam').click()">Take photo</button>
-    <button class="primary" onclick="document.getElementById('filePick').click()">Choose file</button>
-  </div>
-
-  <h3>CEC</h3>
-  <div class="row">
-    <button class="gray" onclick="apiPost('api/cec/playback', {})">Playback (-S)</button>
-    <button class="gray" onclick="apiPost('api/cec/image_view_on', {})">Image View On</button>
-    <button class="danger" onclick="apiPost('api/cec/standby', {})">Standby (TV)</button>
-    <span class="small">Active-source x:</span>
-    <input id="asx" type="number" min="0" max="15" value="2" style="width:70px;">
-    <button class="gray" onclick="setActiveSource()">Set active source</button>
-  </div>
-
-  <h3>Music</h3>
-  <div class="row" style="margin-bottom:10px;">
-    <button class="primary" onclick="musicToggle()">Play/Pause</button>
-    <button class="gray" onclick="musicNext()">Next</button>
-    <span class="small">Volume:</span>
-    <input id="musicVol" type="number" min="0" max="100" value="70" style="width:70px;">
-    <button class="gray" onclick="setMusicVolume()">Set</button>
-    <span id="musicNow" class="small"></span>
-  </div>
-  <div class="row" style="margin-bottom:10px;">
-    <span class="small">Playlist:</span>
-    <select id="playlistSel" style="min-width:220px;"></select>
-    <button class="gray" onclick="playlistStart()">Run playlist</button>
-    <button class="gray" onclick="playlistClear()">Random</button>
-    <button class="gray" onclick="loadPlaylists()">Refresh playlists</button>
-    <span id="playlistStatus" class="small"></span>
-  </div>
-
-  <h3>Images</h3>
-  <div id="status" class="small"></div>
+  <div class="section-title">Images</div>
   <div id="grid" class="grid"></div>
 
 <script>
@@ -2234,22 +2444,27 @@ function connectWS(){
   try {
     if(ws && (ws.readyState === 0 || ws.readyState === 1)) return;
 
+    setWsStatus("WS connecting", "");
+
     ws = new WebSocket(wsUrl());
 
     ws.onopen = () => {
       wsAttempts = 0;
+      setWsStatus("WS connected", "ok");
       setStatus("WS connected", false);
     };
 
     ws.onclose = () => {
       ws = null;
       wsAttempts++;
+      setWsStatus("WS disconnected", "bad");
       setStatus("WS disconnected (reconnecting…)", true);
       scheduleReconnect();
     };
 
     ws.onerror = () => {
       // error will usually be followed by close
+      setWsStatus("WS error", "bad");
       setStatus("WS error (reconnecting…)", true);
     };
 
@@ -2278,6 +2493,7 @@ function connectWS(){
   } catch(e) {
     ws = null;
     wsAttempts++;
+    setWsStatus("WS failed", "bad");
     setStatus("WS failed (reconnecting…)", true);
     scheduleReconnect();
   }
@@ -2290,6 +2506,15 @@ function cssSafe(s){
 function setCurrent(name){
   current = name || "";
 
+  const nameEl = document.getElementById("currentName");
+  if(nameEl){
+    nameEl.textContent = current ? `Current: ${current}` : "Current: --";
+  }
+  const labelEl = document.getElementById("currentThumbLabel");
+  if(labelEl){
+    labelEl.textContent = current ? "Currently showing" : "No image selected";
+  }
+
   // highlight card
   document.querySelectorAll(".card").forEach(c => c.classList.remove("current"));
   if(current){
@@ -2301,11 +2526,11 @@ function setCurrent(name){
   const wrap = document.getElementById("currentThumbWrap");
   const img = document.getElementById("currentThumb");
   if(current){
-    wrap.style.display = "block";
-    img.src = `thumb?name=${encodeURIComponent(current)}&t=${Date.now()}`;
+    if(wrap) wrap.classList.add("has-current");
+    if(img) img.src = `thumb?name=${encodeURIComponent(current)}&t=${Date.now()}`;
   } else {
-    wrap.style.display = "none";
-    img.removeAttribute("src");
+    if(wrap) wrap.classList.remove("has-current");
+    if(img) img.removeAttribute("src");
   }
 }
 
@@ -2330,8 +2555,17 @@ async function apiPost(url, body){
 }
 function setStatus(msg, bad){
   const el = document.getElementById('status');
+  if(!el) return;
   el.textContent = msg;
   el.style.color = bad ? '#f87171' : '#9ca3af';
+}
+function setWsStatus(msg, state){
+  const el = document.getElementById('wsStatus');
+  if(!el) return;
+  el.textContent = msg;
+  el.classList.remove('bad', 'ok');
+  if(state === 'bad') el.classList.add('bad');
+  if(state === 'ok') el.classList.add('ok');
 }
 function fmtBytes(n){
   if(!n) return "0 B";
@@ -2499,7 +2733,11 @@ async function loadImages(){
   const grid = document.getElementById('grid');
   grid.innerHTML = "";
   const imgs = j.images || [];
-  setStatus(`Folder: ${j.folder} — ${imgs.length} files`, false);
+  const folderEl = document.getElementById('folderInfo');
+  if(folderEl){
+    folderEl.textContent = `Folder: ${j.folder} | ${imgs.length} files`;
+  }
+  setStatus("Images loaded", false);
 
   for(const it of imgs){
     const card = document.createElement('div');
@@ -2670,6 +2908,7 @@ loadPlaylists();
 musicState();
 setInterval(musicState, 5000);
 </script>
+  </div>
 </body>
 </html>
 """
