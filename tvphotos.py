@@ -13,9 +13,12 @@ import base64
 import hashlib
 import re
 import locale
+import socket
+import secrets
+import shutil
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlencode
 
 # --- Auto X11 env for running from tty/ssh/systemd ---
 if not os.environ.get("DISPLAY"):
@@ -46,9 +49,14 @@ ALLOWED_NETS = [
 ALLOWED_V6 = {ipaddress.ip_address("::1")}
 STATE_FILENAME = ".fehb_state.json"
 UPDATE_CONFIG_PATH = "~/.tvphotos.yml"
+NAVIDROME_CONFIG_PATH = "./navidrome_credentials.yml"
 FIT_TAG_WIDTH = "__fitw"
 FIT_TAG_HEIGHT = "__fith"
 FIT_HEIGHT_RATIO_THRESHOLD = 0.76
+NAVIDROME_API_VERSION = "1.16.1"
+NAVIDROME_CLIENT_NAME = "tvphotos"
+NAVIDROME_RANDOM_SIZE = 50
+MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
 
 
 def is_allowed_client_ip(ip_str):
@@ -67,6 +75,33 @@ def now_ts():
 
 def read_config_value(key, required=False):
     path = os.path.expanduser(UPDATE_CONFIG_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"^([A-Za-z0-9_.-]+)\s*:\s*(.+)$", line)
+                if not m:
+                    continue
+                k = m.group(1)
+                if k != key:
+                    continue
+                val = m.group(2).strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                return val
+    except FileNotFoundError:
+        if required:
+            raise FileNotFoundError(f"Config not found: {path}")
+        return None
+    if required:
+        raise KeyError(f"{key} not found in {path}")
+    return None
+
+
+def read_config_value_from(path, key, required=False):
+    path = os.path.expanduser(path)
     try:
         with open(path, "r", encoding="utf-8") as f:
             for raw in f:
@@ -115,6 +150,24 @@ def read_delay_value():
     if d > 24 * 3600:
         d = 24 * 3600
     return d
+
+
+def read_navidrome_config():
+    path = os.path.expanduser(NAVIDROME_CONFIG_PATH)
+    url = read_config_value_from(path, "url", required=False)
+    if url is None:
+        url = read_config_value_from(path, "server", required=False)
+    user = read_config_value_from(path, "user", required=False)
+    if user is None:
+        user = read_config_value_from(path, "username", required=False)
+    password = read_config_value_from(path, "password", required=False)
+    if not url or not user or not password:
+        return None
+    return {
+        "url": url,
+        "user": user,
+        "password": password,
+    }
 
 
 def default_delay_s():
@@ -201,6 +254,316 @@ def get_ipv4_addrs():
 
     addrs.add("127.0.0.1")
     return sorted(addrs)
+
+
+# ----------------------------
+# Navidrome / Music helpers
+# ----------------------------
+class NavidromeClient:
+    def __init__(self, base_url, user, password):
+        self.base_url = base_url.rstrip("/")
+        self.user = user
+        self.password = password
+
+    def _auth_params(self):
+        salt = secrets.token_hex(6)
+        token = hashlib.md5((self.password + salt).encode("utf-8")).hexdigest()
+        return {
+            "u": self.user,
+            "t": token,
+            "s": salt,
+            "v": NAVIDROME_API_VERSION,
+            "c": NAVIDROME_CLIENT_NAME,
+            "f": "json",
+        }
+
+    def _request(self, endpoint, params=None):
+        q = {}
+        q.update(self._auth_params())
+        if params:
+            q.update(params)
+        url = self.base_url + "/rest/" + endpoint + ".view?" + urlencode(q)
+        req = urllib.request.Request(url, headers={"User-Agent": "tvphotos/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = resp.read()
+        try:
+            j = json.loads(data.decode("utf-8", errors="ignore"))
+        except Exception:
+            raise ValueError("invalid navidrome response")
+        rsp = j.get("subsonic-response", {})
+        if rsp.get("status") != "ok":
+            err = rsp.get("error", {}) or {}
+            raise ValueError(err.get("message") or "navidrome error")
+        return rsp
+
+    def get_random_songs(self, size=NAVIDROME_RANDOM_SIZE):
+        rsp = self._request("getRandomSongs", {"size": int(size)})
+        songs = rsp.get("randomSongs", {}).get("song", []) or []
+        if isinstance(songs, dict):
+            songs = [songs]
+        return songs
+
+    def stream_url(self, song_id):
+        q = self._auth_params()
+        q["id"] = song_id
+        return self.base_url + "/rest/stream.view?" + urlencode(q)
+
+
+class MPVController:
+    def __init__(self, socket_path=MPV_SOCKET_PATH):
+        self.socket_path = socket_path
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        if self.proc and self.proc.poll() is None:
+            return True
+        if shutil.which("mpv") is None:
+            return False
+        try:
+            if os.path.exists(self.socket_path):
+                os.remove(self.socket_path)
+        except Exception:
+            pass
+        cmd = [
+            "mpv",
+            "--no-video",
+            "--idle=yes",
+            "--force-window=no",
+            "--input-ipc-server=" + self.socket_path,
+            "--quiet",
+        ]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            self.proc = None
+            return False
+        for _ in range(50):
+            if os.path.exists(self.socket_path):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _send(self, obj, expect_reply=True):
+        with self.lock:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(1.5)
+                s.connect(self.socket_path)
+                payload = json.dumps(obj).encode("utf-8") + b"\n"
+                s.sendall(payload)
+                if not expect_reply:
+                    s.close()
+                    return None
+                data = b""
+                while not data.endswith(b"\n"):
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                s.close()
+                if not data:
+                    return None
+                return json.loads(data.decode("utf-8", errors="ignore"))
+            except Exception:
+                return None
+
+    def load(self, url):
+        self._send({"command": ["loadfile", url, "replace"]}, expect_reply=False)
+
+    def set_pause(self, paused):
+        self._send({"command": ["set_property", "pause", bool(paused)]})
+
+    def stop(self):
+        self._send({"command": ["stop"]})
+
+    def set_volume(self, volume):
+        self._send({"command": ["set_property", "volume", float(volume)]})
+
+    def get_property(self, name):
+        resp = self._send({"command": ["get_property", name]})
+        if resp and resp.get("error") == "success":
+            return resp.get("data")
+        return None
+
+
+class MusicManager:
+    def __init__(self, hub, slideshow):
+        self.hub = hub
+        self.slideshow = slideshow
+        self.lock = threading.Lock()
+        self.client = None
+        self.mpv = MPVController()
+        self.enabled = False
+        self.error = None
+        self.queue = []
+        self.current = None
+        self.paused = False
+        self.volume = 70
+
+        cfg = read_navidrome_config()
+        if not cfg:
+            self.error = f"Missing or incomplete {NAVIDROME_CONFIG_PATH}"
+            return
+        self.client = NavidromeClient(cfg["url"], cfg["user"], cfg["password"])
+        if not self.mpv.start():
+            self.error = "mpv not available"
+            return
+
+        self.mpv.set_volume(self.volume)
+        self.enabled = True
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
+
+    def _set_ui_text(self, text):
+        if not self.slideshow:
+            return
+        try:
+            QMetaObject.invokeMethod(self.slideshow, "set_music_text",
+                Qt.ConnectionType.QueuedConnection, Q_ARG(str, text))
+        except Exception:
+            pass
+
+    def _broadcast(self):
+        if not self.hub:
+            return
+        with self.lock:
+            payload = {
+                "type": "music",
+                "track": self.current,
+                "paused": self.paused,
+                "volume": self.volume,
+            }
+        self.hub.broadcast(payload)
+
+    def _song_label(self, song):
+        if not song:
+            return ""
+        title = song.get("title") or ""
+        artist = song.get("artist") or ""
+        if artist and title:
+            return f"{artist} - {title}"
+        return title or artist
+
+    def _next_song(self):
+        with self.lock:
+            if self.queue:
+                return self.queue.pop(0)
+        try:
+            songs = self.client.get_random_songs()
+        except Exception:
+            return None
+        songs = [s for s in songs if s.get("id")]
+        if not songs:
+            return None
+        with self.lock:
+            self.queue = songs
+            return self.queue.pop(0)
+
+    def _play_song(self, song):
+        if not song:
+            return
+        track = {
+            "id": song.get("id"),
+            "title": song.get("title") or "",
+            "artist": song.get("artist") or "",
+        }
+        url = self.client.stream_url(track["id"])
+        self.mpv.load(url)
+        self.mpv.set_pause(False)
+        with self.lock:
+            self.current = track
+            self.paused = False
+        self._set_ui_text(self._song_label(track))
+        self._broadcast()
+
+    def _loop(self):
+        while True:
+            if not self.enabled:
+                time.sleep(2)
+                continue
+
+            if self.current is None:
+                song = self._next_song()
+                if song:
+                    self._play_song(song)
+                else:
+                    time.sleep(2)
+                continue
+
+            if not self.paused:
+                idle = self.mpv.get_property("idle-active")
+                if idle:
+                    song = self._next_song()
+                    if song:
+                        self._play_song(song)
+            time.sleep(1)
+
+    def state(self):
+        if not self.enabled:
+            return {"ok": False, "error": self.error or "music disabled"}
+        with self.lock:
+            return {
+                "ok": True,
+                "track": self.current,
+                "paused": self.paused,
+                "volume": self.volume,
+            }
+
+    def toggle_pause(self):
+        if not self.enabled:
+            return self.state()
+        with self.lock:
+            self.paused = not self.paused
+            paused = self.paused
+        self.mpv.set_pause(paused)
+        self._broadcast()
+        return self.state()
+
+    def pause(self):
+        if not self.enabled:
+            return self.state()
+        with self.lock:
+            self.paused = True
+        self.mpv.set_pause(True)
+        self._broadcast()
+        return self.state()
+
+    def resume(self):
+        if not self.enabled:
+            return self.state()
+        with self.lock:
+            self.paused = False
+        self.mpv.set_pause(False)
+        self._broadcast()
+        return self.state()
+
+    def next(self):
+        if not self.enabled:
+            return self.state()
+        self.mpv.stop()
+        with self.lock:
+            self.current = None
+            self.paused = False
+        self._broadcast()
+        return self.state()
+
+    def set_volume(self, volume):
+        if not self.enabled:
+            return self.state()
+        try:
+            v = float(volume)
+        except Exception:
+            v = self.volume
+        if v < 0:
+            v = 0
+        if v > 100:
+            v = 100
+        with self.lock:
+            self.volume = v
+        self.mpv.set_volume(v)
+        self._broadcast()
+        return self.state()
 
 
 # ----------------------------
@@ -706,6 +1069,18 @@ class Slideshow(QWidget):
         shadow.setColor(Qt.GlobalColor.black)
         self.clock.setGraphicsEffect(shadow)
 
+        self.music = QLabel(self)
+        self.music.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.music.setFont(QFont("DejaVu Sans", 18, 500))
+        self.music.setStyleSheet("color: rgba(255,255,255,128);")
+        self.music.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        music_shadow = QGraphicsDropShadowEffect(self)
+        music_shadow.setBlurRadius(8)
+        music_shadow.setOffset(0, 2)
+        music_shadow.setColor(Qt.GlobalColor.black)
+        self.music.setGraphicsEffect(music_shadow)
+
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
         QShortcut(QKeySequence("Space"), self, activated=self.show_next)
@@ -781,6 +1156,14 @@ class Slideshow(QWidget):
         self.clock.adjustSize()
         w = self.clock.width()
         self.clock.move(self.width() - w - self.margin, self.margin)
+        self.music.adjustSize()
+        mw = self.music.width()
+        self.music.move(self.width() - mw - self.margin, self.margin + self.clock.height() + 6)
+
+    @pyqtSlot(str)
+    def set_music_text(self, text):
+        self.music.setText(text or "")
+        self.layout_clock()
 
     def tick(self):
         self.clock.setText(datetime.now().strftime("%A %d %B %Y\n%H:%M"))
@@ -905,7 +1288,7 @@ def parse_multipart_first_file(content_type, body_bytes):
 # ----------------------------
 # Web server + WebSocket upgrade
 # ----------------------------
-def make_handler(mgr, slideshow, hub):
+def make_handler(mgr, slideshow, hub, music):
     class Handler(BaseHTTPRequestHandler):
         server_version = "fehb/1.5"
 
@@ -1063,6 +1446,11 @@ def make_handler(mgr, slideshow, hub):
                     "images": mgr.list_images(),
                 })
 
+            if route == "/api/music/state":
+                if music:
+                    return self._json(music.state())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
             if route == "/thumb":
                 qs = parse_qs(u.query or "")
                 name = (qs.get("name") or [""])[0]
@@ -1200,6 +1588,31 @@ def make_handler(mgr, slideshow, hub):
                     Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
                 return self._json({"ok": True, "delay_s": d})
 
+            if route == "/api/music/next":
+                if music:
+                    return self._json(music.next())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
+            if route == "/api/music/toggle":
+                if music:
+                    return self._json(music.toggle_pause())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
+            if route == "/api/music/pause":
+                if music:
+                    return self._json(music.pause())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
+            if route == "/api/music/resume":
+                if music:
+                    return self._json(music.resume())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
+            if route == "/api/music/volume":
+                if music:
+                    return self._json(music.set_volume(body.get("volume")))
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
             if route == "/api/cec/playback":
                 res = run_cec(["--playback", "-S"])
                 return self._json(res, 200 if res["ok"] else 500)
@@ -1318,6 +1731,16 @@ INDEX_HTML = r"""<!doctype html>
     <button class="gray" onclick="setActiveSource()">Set active source</button>
   </div>
 
+  <h3>Music</h3>
+  <div class="row" style="margin-bottom:10px;">
+    <button class="primary" onclick="musicToggle()">Play/Pause</button>
+    <button class="gray" onclick="musicNext()">Next</button>
+    <span class="small">Volume:</span>
+    <input id="musicVol" type="number" min="0" max="100" value="70" style="width:70px;">
+    <button class="gray" onclick="setMusicVolume()">Set</button>
+    <span id="musicNow" class="small"></span>
+  </div>
+
   <h3>Images</h3>
   <div id="status" class="small"></div>
   <div id="grid" class="grid"></div>
@@ -1374,13 +1797,24 @@ function connectWS(){
     ws.onmessage = (ev) => {
       let msg = null;
       try { msg = JSON.parse(ev.data); } catch(e) { return; }
-      if(!msg || msg.type !== "state") return;
-
-      if(typeof msg.delay_s === "number"){
-        document.getElementById("delay").value = msg.delay_s;
+      if(!msg) return;
+      if(msg.type === "state"){
+        if(typeof msg.delay_s === "number"){
+          document.getElementById("delay").value = msg.delay_s;
+        }
+        if(typeof msg.current === "string"){
+          setCurrent(msg.current);
+        }
       }
-      if(typeof msg.current === "string"){
-        setCurrent(msg.current);
+      if(msg.type === "music"){
+        if(typeof msg.volume === "number"){
+          document.getElementById("musicVol").value = msg.volume;
+        }
+        if(msg.track){
+          setMusicNow(msg.track);
+        } else {
+          setMusicNow(null);
+        }
       }
     };
   } catch(e) {
@@ -1460,6 +1894,46 @@ function fmtRatio(r){
 function fmtDim(w,h){
   if(!w || !h) return "";
   return `${w}×${h}`;
+}
+
+function setMusicNow(track){
+  const el = document.getElementById('musicNow');
+  if(!el) return;
+  if(track && (track.title || track.artist)){
+    const t = track.title || '';
+    const a = track.artist || '';
+    el.textContent = a && t ? `${a} - ${t}` : (t || a);
+  } else {
+    el.textContent = '';
+  }
+}
+
+async function musicState(){
+  const j = await apiGet('api/music/state');
+  if(!j || j.ok === false){
+    setMusicNow(null);
+    return;
+  }
+  if(typeof j.volume === "number"){
+    document.getElementById("musicVol").value = j.volume;
+  }
+  setMusicNow(j.track || null);
+}
+
+async function musicToggle(){
+  await apiPost('api/music/toggle', {});
+  await musicState();
+}
+
+async function musicNext(){
+  await apiPost('api/music/next', {});
+  await musicState();
+}
+
+async function setMusicVolume(){
+  const v = parseFloat(document.getElementById('musicVol').value || "70");
+  await apiPost('api/music/volume', {volume: v});
+  await musicState();
 }
 
 async function loadImages(){
@@ -1643,14 +2117,16 @@ document.getElementById("fileCam").addEventListener("change", (e) => {
 // start
 connectWS();
 loadImages();
+musicState();
+setInterval(musicState, 5000);
 </script>
 </body>
 </html>
 """
 
 
-def start_server(mgr, slideshow, hub, host="0.0.0.0", port=DEFAULT_PORT):
-    Handler = make_handler(mgr, slideshow, hub)
+def start_server(mgr, slideshow, hub, music, host="0.0.0.0", port=DEFAULT_PORT):
+    Handler = make_handler(mgr, slideshow, hub, music)
     httpd = ThreadingHTTPServer((host, port), Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
@@ -1669,8 +2145,9 @@ def main():
     app = QApplication(sys.argv)
     apply_locale_from_config()
     w = Slideshow(mgr, hub, delay_s=mgr.delay_s)
+    music = MusicManager(hub, w)
 
-    start_server(mgr, w, hub, host="0.0.0.0", port=port)
+    start_server(mgr, w, hub, music, host="0.0.0.0", port=port)
 
     addrs = get_ipv4_addrs()
     print("[fehb] web ui URLs:")
