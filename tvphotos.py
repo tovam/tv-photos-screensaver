@@ -4,6 +4,7 @@ import sys
 import glob
 import time
 import json
+import html
 import random
 import threading
 import subprocess
@@ -421,6 +422,7 @@ class MusicManager:
         self.playlist_name = ""
         self.playlist_entries = []
         self.playlist_idx = 0
+        self._last_ui_text = ""
 
         cfg = read_navidrome_config()
         if not cfg:
@@ -444,6 +446,124 @@ class MusicManager:
                 Qt.ConnectionType.QueuedConnection, Q_ARG(str, text))
         except Exception:
             pass
+
+    def _fmt_clock(self, seconds):
+        if seconds is None:
+            return ""
+        try:
+            sec = int(seconds)
+        except Exception:
+            return ""
+        if sec < 0:
+            sec = 0
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        if h > 0:
+            return f"{h}:{m:02d}:{s:02d}"
+        return f"{m}:{s:02d}"
+
+    def _playback_times(self):
+        if not self.enabled:
+            return None, None
+        pos = self.mpv.get_property("time-pos")
+        dur = self.mpv.get_property("duration")
+        try:
+            pos = float(pos)
+        except Exception:
+            pos = None
+        try:
+            dur = float(dur)
+        except Exception:
+            dur = None
+        if dur is not None and dur <= 0:
+            dur = None
+        if pos is not None and pos < 0:
+            pos = 0
+        return pos, dur
+
+    def _peek_next_track(self):
+        with self.lock:
+            source = self.source
+            playlist_id = self.playlist_id
+            playlist_entries = list(self.playlist_entries)
+            playlist_idx = int(self.playlist_idx)
+            queue = list(self.queue)
+
+        if source == "playlist" and playlist_id:
+            for i in range(playlist_idx, len(playlist_entries)):
+                song = playlist_entries[i]
+                if not song or not isinstance(song, dict):
+                    continue
+                sid = song.get("id")
+                if sid:
+                    return {"id": sid, "title": song.get("title") or "", "artist": song.get("artist") or ""}
+            return None
+
+        for song in queue:
+            if not song or not isinstance(song, dict):
+                continue
+            sid = song.get("id")
+            if not sid:
+                continue
+            return {"id": sid, "title": song.get("title") or "", "artist": song.get("artist") or ""}
+        return None
+
+    def _next_label(self):
+        track = self._peek_next_track()
+        if not track:
+            return ""
+        return self._build_label(track)
+
+    def _compose_ui_text(self):
+        with self.lock:
+            current = self.current
+            label = self.label
+
+        if not label and current:
+            label = self._build_label(current)
+
+        pos = dur = None
+        if current:
+            pos, dur = self._playback_times()
+        pos_txt = self._fmt_clock(pos)
+        dur_txt = self._fmt_clock(dur)
+        if pos_txt and not dur_txt:
+            dur_txt = "--:--"
+
+        time_text = ""
+        if pos_txt and dur_txt:
+            time_text = f"{pos_txt} / {dur_txt}"
+        elif pos_txt:
+            time_text = pos_txt
+
+        top_line = (label or "").strip()
+        if time_text:
+            if top_line:
+                top_line = f"{top_line} {time_text}"
+            else:
+                top_line = time_text
+
+        next_label = self._next_label()
+        if not top_line and not next_label:
+            return ""
+
+        top_html = html.escape(top_line) if top_line else ""
+        if next_label:
+            next_html = html.escape(f"Next: {next_label}")
+            if top_html:
+                return (
+                    f"<div>{top_html}</div>"
+                    f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>"
+                )
+            return f"<div style=\"font-size:9pt; opacity:0.8;\">{next_html}</div>"
+        return top_html
+
+    def _refresh_ui(self):
+        text = self._compose_ui_text()
+        if text != self._last_ui_text:
+            self._last_ui_text = text
+            self._set_ui_text(text)
 
     def _broadcast(self):
         if not self.hub:
@@ -542,7 +662,8 @@ class MusicManager:
         with self.lock:
             self.current = track
             self.paused = False
-        self._set_ui_text(self._song_label(track))
+        self._song_label(track)
+        self._refresh_ui()
         self._broadcast()
 
     def _loop(self):
@@ -557,6 +678,7 @@ class MusicManager:
                     self._play_song(song)
                 else:
                     time.sleep(2)
+                self._refresh_ui()
                 continue
 
             if not self.paused:
@@ -565,6 +687,7 @@ class MusicManager:
                     song = self._next_song()
                     if song:
                         self._play_song(song)
+            self._refresh_ui()
             time.sleep(1)
 
     def state(self):
@@ -1212,6 +1335,7 @@ class Slideshow(QWidget):
             "padding: 6px 10px;"
         )
         self.music.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.music.setTextFormat(Qt.TextFormat.RichText)
 
         music_shadow = QGraphicsDropShadowEffect(self)
         music_shadow.setBlurRadius(16)
