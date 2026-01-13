@@ -487,6 +487,7 @@ class MusicManager:
         self.playlist_idx = 0
         self._last_ui_text = ""
         self._last_ui_progress = -1
+        self._last_ui_duration = -1
 
         cfg = read_navidrome_config()
         if not cfg:
@@ -517,6 +518,15 @@ class MusicManager:
         try:
             QMetaObject.invokeMethod(self.slideshow, "set_music_progress",
                 Qt.ConnectionType.QueuedConnection, Q_ARG(int, int(value)))
+        except Exception:
+            pass
+
+    def _set_ui_duration(self, seconds):
+        if not self.slideshow:
+            return
+        try:
+            QMetaObject.invokeMethod(self.slideshow, "set_music_duration",
+                Qt.ConnectionType.QueuedConnection, Q_ARG(int, int(seconds)))
         except Exception:
             pass
 
@@ -555,8 +565,7 @@ class MusicManager:
             pos = 0
         return pos, dur
 
-    def _progress_value(self):
-        pos, dur = self._playback_times()
+    def _progress_value_from_times(self, pos, dur):
         if pos is None or dur is None or dur <= 0:
             return None
         ratio = pos / dur
@@ -565,6 +574,10 @@ class MusicManager:
         if ratio > 1:
             ratio = 1
         return int(round(ratio * 1000))
+
+    def _progress_value(self):
+        pos, dur = self._playback_times()
+        return self._progress_value_from_times(pos, dur)
 
     def _peek_next_track(self):
         with self.lock:
@@ -603,7 +616,7 @@ class MusicManager:
             return ""
         return self._build_label(track)
 
-    def _compose_ui_text(self):
+    def _compose_ui_text(self, pos=None, dur=None):
         with self.lock:
             current = self.current
             label = self.label
@@ -611,8 +624,7 @@ class MusicManager:
         if not label and current:
             label = self._build_label(current)
 
-        pos = dur = None
-        if current:
+        if current and (pos is None and dur is None):
             pos, dur = self._playback_times()
         pos_txt = self._fmt_clock(pos)
         dur_txt = self._fmt_clock(dur)
@@ -642,15 +654,29 @@ class MusicManager:
         return "".join(parts)
 
     def _refresh_ui(self):
-        text = self._compose_ui_text()
+        pos = dur = None
+        if self.current:
+            pos, dur = self._playback_times()
+
+        text = self._compose_ui_text(pos, dur)
         if text != self._last_ui_text:
             self._last_ui_text = text
             self._set_ui_text(text)
-        progress = self._progress_value() if self.current else None
+        progress = self._progress_value_from_times(pos, dur) if self.current else None
         progress_int = -1 if progress is None else progress
         if progress_int != self._last_ui_progress:
             self._last_ui_progress = progress_int
             self._set_ui_progress(progress_int)
+
+        dur_int = -1
+        if dur is not None:
+            try:
+                dur_int = int(dur)
+            except Exception:
+                dur_int = -1
+        if dur_int != self._last_ui_duration:
+            self._last_ui_duration = dur_int
+            self._set_ui_duration(dur_int)
 
     def _broadcast(self):
         if not self.hub:
@@ -1245,6 +1271,8 @@ class ImageManager:
         self.disabled = set()
         self.active_source_x = 2
         self.delay_s = default_delay_s()
+        self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
+        self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
         self._files = []
         self.load_state()
         self.refresh_files()
@@ -1262,14 +1290,26 @@ class ImageManager:
                     self.active_source_x = int(d.get("active_source_x", 2))
                 except Exception:
                     self.active_source_x = 2
-                try:
-                    self.delay_s = int(d.get("delay_s", default_delay_s()))
-                except Exception:
-                    self.delay_s = default_delay_s()
-            except FileNotFoundError:
-                pass
+            try:
+                self.delay_s = int(d.get("delay_s", default_delay_s()))
             except Exception:
-                pass
+                self.delay_s = default_delay_s()
+            try:
+                self.music_bar_strategy = int(d.get("music_bar_strategy", MUSIC_BAR_STRATEGY_DEFAULT))
+            except Exception:
+                self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
+            try:
+                self.music_bar_ratio = float(d.get("music_bar_ratio", MUSIC_BAR_WIDTH_RATIO_DEFAULT))
+            except Exception:
+                self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
+            if self.music_bar_strategy not in (1, 2, 3):
+                self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
+            if self.music_bar_ratio <= 0:
+                self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     def save_state(self):
         with self.lock:
@@ -1277,6 +1317,8 @@ class ImageManager:
                 "disabled": sorted(list(self.disabled)),
                 "active_source_x": int(self.active_source_x),
                 "delay_s": int(self.delay_s),
+                "music_bar_strategy": int(self.music_bar_strategy),
+                "music_bar_ratio": float(self.music_bar_ratio),
                 "saved_at": now_ts(),
             }
             try:
@@ -1426,6 +1468,28 @@ class ImageManager:
             self.delay_s = d
         self.save_state()
         return d
+
+    def set_music_bar(self, strategy, ratio):
+        try:
+            s = int(strategy)
+        except Exception:
+            s = self.music_bar_strategy
+        if s not in (1, 2, 3):
+            s = self.music_bar_strategy
+
+        try:
+            r = float(ratio)
+        except Exception:
+            r = self.music_bar_ratio
+        if r <= 0:
+            r = self.music_bar_ratio
+        r = max(0.05, min(0.8, r))
+
+        with self.lock:
+            self.music_bar_strategy = s
+            self.music_bar_ratio = r
+        self.save_state()
+        return s, r
 
     def save_uploaded_image_bytes_as_jpeg(self, raw_bytes, suggested_name):
         from io import BytesIO
@@ -1687,6 +1751,22 @@ def start_cec_key_listener(music):
 # ----------------------------
 # Qt slideshow
 # ----------------------------
+# Music bar strategies
+# 1) Match-label-width: bar width follows the music label width, with a minimum of 220px.
+#    Placement: bottom-left, aligned to self.margin; bar sits directly under the label
+#    with a 6px gap; bar height is fixed (10px). Padding is from the QProgressBar
+#    stylesheet (border + rounded corners), not layout math.
+# 2) Constant-width: bar width is a fixed ratio of the window width
+#    (MUSIC_BAR_WIDTH_RATIO_DEFAULT). Placement matches strategy 1.
+# 3) Duration-linear: bar width ratio scales linearly with track length.
+#    3m30s (210s) => 25% width; max ratio caps at 40%. If duration is unknown,
+#    it falls back to the configured ratio from strategy 2. Placement matches strategy 1.
+MUSIC_BAR_STRATEGY_DEFAULT = 2
+MUSIC_BAR_WIDTH_RATIO_DEFAULT = 0.25
+MUSIC_BAR_DURATION_BASE_S = 210.0
+MUSIC_BAR_DURATION_BASE_RATIO = 0.25
+MUSIC_BAR_DURATION_MAX_RATIO = 0.40
+
 class Slideshow(QWidget):
     def __init__(self, manager, hub, delay_s=None):
         super().__init__()
@@ -1702,6 +1782,9 @@ class Slideshow(QWidget):
         self._playlist = []
         self._idx = 0
         self.current_path = None
+        self.music_bar_strategy = int(getattr(self.mgr, "music_bar_strategy", MUSIC_BAR_STRATEGY_DEFAULT))
+        self.music_bar_ratio = float(getattr(self.mgr, "music_bar_ratio", MUSIC_BAR_WIDTH_RATIO_DEFAULT))
+        self.music_bar_duration_s = None
 
         self.setWindowTitle("TV UI")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -1851,9 +1934,60 @@ class Slideshow(QWidget):
             y = self.height() - total_h - self.margin
             self.music.move(self.margin, y)
             if bar_visible:
-                bar_w = max(220, self.music.width())
+                if self.music_bar_strategy == 2:
+                    ratio = self.music_bar_ratio
+                    bar_w = max(1, int(self.width() * ratio))
+                elif self.music_bar_strategy == 3:
+                    ratio = self._music_bar_ratio_for_duration()
+                    bar_w = max(1, int(self.width() * ratio))
+                else:
+                    bar_w = max(220, self.music.width())
                 self.music_bar.setFixedWidth(bar_w)
                 self.music_bar.move(self.margin, y + mh + gap)
+
+    def _music_bar_ratio_for_duration(self):
+        dur = self.music_bar_duration_s
+        if dur is None or dur <= 0:
+            return self.music_bar_ratio
+        ratio = MUSIC_BAR_DURATION_BASE_RATIO * (float(dur) / MUSIC_BAR_DURATION_BASE_S)
+        if ratio < 0:
+            ratio = 0
+        if ratio > MUSIC_BAR_DURATION_MAX_RATIO:
+            ratio = MUSIC_BAR_DURATION_MAX_RATIO
+        return ratio
+
+    @pyqtSlot(int, float)
+    def apply_music_bar_config(self, strategy, ratio):
+        try:
+            s = int(strategy)
+        except Exception:
+            s = self.music_bar_strategy
+        if s not in (1, 2, 3):
+            s = self.music_bar_strategy
+
+        try:
+            r = float(ratio)
+        except Exception:
+            r = self.music_bar_ratio
+        if r <= 0:
+            r = self.music_bar_ratio
+        r = max(0.05, min(0.8, r))
+
+        self.music_bar_strategy = s
+        self.music_bar_ratio = r
+        self.layout_clock()
+
+    @pyqtSlot(int)
+    def set_music_duration(self, seconds):
+        try:
+            s = int(seconds)
+        except Exception:
+            s = -1
+        if s <= 0:
+            self.music_bar_duration_s = None
+        else:
+            self.music_bar_duration_s = s
+        self.layout_clock()
 
     @pyqtSlot(str)
     def set_music_text(self, text):
@@ -2172,7 +2306,10 @@ def make_handler(mgr, slideshow, hub, music):
 
             if route == "/api/music/state":
                 if music:
-                    return self._json(music.state())
+                    data = music.state()
+                    data["music_bar_strategy"] = int(mgr.music_bar_strategy)
+                    data["music_bar_ratio"] = float(mgr.music_bar_ratio)
+                    return self._json(data)
                 return self._json({"ok": False, "error": "music disabled"}, 400)
 
             if route == "/api/music/playlists":
@@ -2316,6 +2453,14 @@ def make_handler(mgr, slideshow, hub, music):
                 QMetaObject.invokeMethod(slideshow, "apply_delay",
                     Qt.ConnectionType.QueuedConnection, Q_ARG(int, d))
                 return self._json({"ok": True, "delay_s": d})
+
+            if route == "/api/config/music_bar":
+                strategy = body.get("strategy", mgr.music_bar_strategy)
+                ratio = body.get("ratio", mgr.music_bar_ratio)
+                s, r = mgr.set_music_bar(strategy, ratio)
+                QMetaObject.invokeMethod(slideshow, "apply_music_bar_config",
+                    Qt.ConnectionType.QueuedConnection, Q_ARG(int, int(s)), Q_ARG(float, float(r)))
+                return self._json({"ok": True, "strategy": s, "ratio": r})
 
             if route == "/api/music/next":
                 if music:
@@ -2632,7 +2777,7 @@ INDEX_HTML = r"""<!doctype html>
           </div>
         </div>
       </div>
-      <div class="panel">
+        <div class="panel">
         <div class="panel-title">Music</div>
         <div class="panel-body">
           <div class="row">
@@ -2650,6 +2795,18 @@ INDEX_HTML = r"""<!doctype html>
             <button class="gray" onclick="playlistClear()">Random</button>
             <button class="gray" onclick="loadPlaylists()">Refresh playlists</button>
             <span id="playlistStatus" class="small"></span>
+          </div>
+          <div class="row">
+            <span class="field-label">Music bar</span>
+            <select id="musicBarStrategy">
+              <option value="1">1: Match label width</option>
+              <option value="2">2: Constant width</option>
+              <option value="3">3: Length-based width</option>
+            </select>
+            <span class="field-label">Width %</span>
+            <input id="musicBarWidth" type="number" min="5" max="80" step="1" value="25" style="width:70px;">
+            <button class="gray" onclick="setMusicBarConfig()">Apply</button>
+            <span id="musicBarHint" class="small"></span>
           </div>
         </div>
       </div>
@@ -2938,6 +3095,37 @@ async function playlistClear(){
   await musicState();
 }
 
+function syncMusicBarControls(strategy){
+  const sel = document.getElementById('musicBarStrategy');
+  const width = document.getElementById('musicBarWidth');
+  const hint = document.getElementById('musicBarHint');
+  if(!sel || !width || !hint) return;
+
+  const s = parseInt(strategy || sel.value || "2", 10);
+  if(s === 2){
+    width.disabled = false;
+    hint.textContent = '';
+  } else if(s === 3){
+    width.disabled = true;
+    hint.textContent = 'Length-based (3:30 => 25%, max 40%)';
+  } else {
+    width.disabled = true;
+    hint.textContent = 'Width follows label';
+  }
+}
+
+async function setMusicBarConfig(){
+  const sel = document.getElementById('musicBarStrategy');
+  const width = document.getElementById('musicBarWidth');
+  if(!sel || !width) return;
+  const strategy = parseInt(sel.value || "2", 10);
+  let pct = parseFloat(width.value || "25");
+  if(isNaN(pct)) pct = 25;
+  const ratio = pct / 100.0;
+  await apiPost('api/config/music_bar', {strategy, ratio});
+  await musicState();
+}
+
 async function musicState(){
   const j = await apiGet('api/music/state');
   if(!j || j.ok === false){
@@ -2945,6 +3133,15 @@ async function musicState(){
   }
   if(typeof j.volume === "number"){
     document.getElementById("musicVol").value = j.volume;
+  }
+  if(typeof j.music_bar_strategy === "number"){
+    const sel = document.getElementById("musicBarStrategy");
+    if(sel) sel.value = String(j.music_bar_strategy);
+    syncMusicBarControls(j.music_bar_strategy);
+  }
+  if(typeof j.music_bar_ratio === "number"){
+    const w = document.getElementById("musicBarWidth");
+    if(w) w.value = Math.round(j.music_bar_ratio * 100);
   }
   setMusicNow(j.track || null, j.label || "");
   updatePlaylistState(j);
@@ -3147,6 +3344,12 @@ document.getElementById("fileCam").addEventListener("change", (e) => {
   e.target.value = "";
   uploadFile(f);
 });
+
+const musicBarSel = document.getElementById("musicBarStrategy");
+if(musicBarSel){
+  musicBarSel.addEventListener("change", () => syncMusicBarControls());
+  syncMusicBarControls(musicBarSel.value);
+}
 
 // start
 connectWS();

@@ -1,2 +1,4 @@
 navidrome_credentials.yml
 __pycache__/
+.code/
+ceclib.py
