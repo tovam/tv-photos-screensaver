@@ -1290,22 +1290,22 @@ class ImageManager:
                     self.active_source_x = int(d.get("active_source_x", 2))
                 except Exception:
                     self.active_source_x = 2
-            try:
-                self.delay_s = int(d.get("delay_s", default_delay_s()))
-            except Exception:
-                self.delay_s = default_delay_s()
-            try:
-                self.music_bar_strategy = int(d.get("music_bar_strategy", MUSIC_BAR_STRATEGY_DEFAULT))
-            except Exception:
-                self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
-            try:
-                self.music_bar_ratio = float(d.get("music_bar_ratio", MUSIC_BAR_WIDTH_RATIO_DEFAULT))
-            except Exception:
-                self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
-            if self.music_bar_strategy not in (1, 2, 3):
-                self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
-            if self.music_bar_ratio <= 0:
-                self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
+                try:
+                    self.delay_s = int(d.get("delay_s", default_delay_s()))
+                except Exception:
+                    self.delay_s = default_delay_s()
+                try:
+                    self.music_bar_strategy = int(d.get("music_bar_strategy", MUSIC_BAR_STRATEGY_DEFAULT))
+                except Exception:
+                    self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
+                try:
+                    self.music_bar_ratio = float(d.get("music_bar_ratio", MUSIC_BAR_WIDTH_RATIO_DEFAULT))
+                except Exception:
+                    self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
+                if self.music_bar_strategy not in (1, 2, 3):
+                    self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
+                if self.music_bar_ratio <= 0:
+                    self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
         except FileNotFoundError:
             pass
         except Exception:
