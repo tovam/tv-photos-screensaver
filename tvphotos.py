@@ -303,6 +303,21 @@ class NavidromeClient:
             songs = [songs]
         return songs
 
+    def get_playlists(self):
+        rsp = self._request("getPlaylists")
+        playlists = rsp.get("playlists", {}).get("playlist", []) or []
+        if isinstance(playlists, dict):
+            playlists = [playlists]
+        return playlists
+
+    def get_playlist(self, playlist_id):
+        rsp = self._request("getPlaylist", {"id": playlist_id})
+        pl = rsp.get("playlist", {}) or {}
+        entries = pl.get("entry") or pl.get("song") or []
+        if isinstance(entries, dict):
+            entries = [entries]
+        return pl, entries
+
     def stream_url(self, song_id):
         q = self._auth_params()
         q["id"] = song_id
@@ -401,6 +416,11 @@ class MusicManager:
         self.paused = False
         self.volume = 70
         self.label = ""
+        self.source = "random"
+        self.playlist_id = None
+        self.playlist_name = ""
+        self.playlist_entries = []
+        self.playlist_idx = 0
 
         cfg = read_navidrome_config()
         if not cfg:
@@ -435,6 +455,10 @@ class MusicManager:
                 "paused": self.paused,
                 "volume": self.volume,
                 "label": self.label,
+                "source": self.source,
+                "playlist": {"id": self.playlist_id, "name": self.playlist_name} if self.playlist_id else None,
+                "playlist_idx": self.playlist_idx,
+                "playlist_count": len(self.playlist_entries) if self.playlist_id else 0,
             }
         self.hub.broadcast(payload)
 
@@ -458,8 +482,41 @@ class MusicManager:
 
     def _next_song(self):
         with self.lock:
-            if self.queue:
-                return self.queue.pop(0)
+            if self.source == "playlist" and self.playlist_id:
+                playlist_id = self.playlist_id
+                playlist_entries = list(self.playlist_entries)
+                playlist_idx = int(self.playlist_idx)
+            else:
+                playlist_id = None
+                playlist_entries = []
+                playlist_idx = 0
+                if self.queue:
+                    return self.queue.pop(0)
+
+        if playlist_id:
+            entries = playlist_entries
+            if not entries or playlist_idx >= len(entries):
+                try:
+                    pl, entries = self.client.get_playlist(playlist_id)
+                except Exception:
+                    return None
+                entries = [s for s in entries if s.get("id")]
+                if not entries:
+                    return None
+                playlist_idx = 0
+                with self.lock:
+                    name = (pl.get("name") or "").strip()
+                    if name:
+                        self.playlist_name = name
+                    self.playlist_entries = entries
+
+            song = entries[playlist_idx] if playlist_idx < len(entries) else None
+            if not song:
+                return None
+            with self.lock:
+                self.playlist_idx = playlist_idx + 1
+            return song
+
         try:
             songs = self.client.get_random_songs()
         except Exception:
@@ -520,7 +577,70 @@ class MusicManager:
                 "paused": self.paused,
                 "volume": self.volume,
                 "label": self.label,
+                "source": self.source,
+                "playlist": {"id": self.playlist_id, "name": self.playlist_name} if self.playlist_id else None,
+                "playlist_idx": self.playlist_idx,
+                "playlist_count": len(self.playlist_entries) if self.playlist_id else 0,
             }
+
+    def playlists(self):
+        if not self.enabled:
+            return {"ok": False, "error": self.error or "music disabled"}
+        try:
+            playlists = self.client.get_playlists()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        out = []
+        for pl in playlists or []:
+            pid = pl.get("id")
+            if not pid:
+                continue
+            out.append({
+                "id": str(pid),
+                "name": pl.get("name") or "",
+                "songCount": pl.get("songCount") or pl.get("song_count") or 0,
+            })
+        return {"ok": True, "playlists": out}
+
+    def set_playlist(self, playlist_id):
+        if not self.enabled:
+            return self.state()
+        try:
+            pl, entries = self.client.get_playlist(playlist_id)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        entries = [s for s in entries if s.get("id")]
+        if not entries:
+            return {"ok": False, "error": "empty playlist"}
+        name = (pl.get("name") or "").strip()
+        with self.lock:
+            self.source = "playlist"
+            self.playlist_id = str(playlist_id)
+            self.playlist_name = name
+            self.playlist_entries = entries
+            self.playlist_idx = 0
+            self.queue = []
+            self.current = None
+            self.paused = False
+        self.mpv.stop()
+        self._broadcast()
+        return self.state()
+
+    def clear_playlist(self):
+        if not self.enabled:
+            return self.state()
+        with self.lock:
+            self.source = "random"
+            self.playlist_id = None
+            self.playlist_name = ""
+            self.playlist_entries = []
+            self.playlist_idx = 0
+            self.queue = []
+            self.current = None
+            self.paused = False
+        self.mpv.stop()
+        self._broadcast()
+        return self.state()
 
     def toggle_pause(self):
         if not self.enabled:
@@ -1061,7 +1181,7 @@ class Slideshow(QWidget):
         self._idx = 0
         self.current_path = None
 
-        self.setWindowTitle("Wallpaper Clock")
+        self.setWindowTitle("TV UI")
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setCursor(Qt.CursorShape.BlankCursor)
 
@@ -1082,16 +1202,23 @@ class Slideshow(QWidget):
         self.clock.setGraphicsEffect(shadow)
 
         self.music = QLabel(self)
-        self.music.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        self.music.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.music.setFont(QFont("DejaVu Sans", 18, 500))
-        self.music.setStyleSheet("color: rgba(255,255,255,128);")
+        self.music.setStyleSheet(
+            "color: rgba(255,255,255,220);"
+            "background-color: rgba(0,0,0,0.35);"
+            "border: 1px solid rgba(255,255,255,0.12);"
+            "border-radius: 10px;"
+            "padding: 6px 10px;"
+        )
         self.music.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         music_shadow = QGraphicsDropShadowEffect(self)
-        music_shadow.setBlurRadius(8)
+        music_shadow.setBlurRadius(16)
         music_shadow.setOffset(0, 2)
         music_shadow.setColor(Qt.GlobalColor.black)
         self.music.setGraphicsEffect(music_shadow)
+        self.music.hide()
 
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
@@ -1168,13 +1295,19 @@ class Slideshow(QWidget):
         self.clock.adjustSize()
         w = self.clock.width()
         self.clock.move(self.width() - w - self.margin, self.margin)
-        self.music.adjustSize()
-        mw = self.music.width()
-        self.music.move(self.width() - mw - self.margin, self.margin + self.clock.height() + 6)
+        if self.music.isVisible():
+            self.music.adjustSize()
+            mh = self.music.height()
+            self.music.move(self.margin, self.height() - mh - self.margin)
 
     @pyqtSlot(str)
     def set_music_text(self, text):
-        self.music.setText(text or "")
+        text = text or ""
+        if text:
+            self.music.setText(text)
+            self.music.show()
+        else:
+            self.music.hide()
         self.layout_clock()
 
     def tick(self):
@@ -1463,6 +1596,11 @@ def make_handler(mgr, slideshow, hub, music):
                     return self._json(music.state())
                 return self._json({"ok": False, "error": "music disabled"}, 400)
 
+            if route == "/api/music/playlists":
+                if music:
+                    return self._json(music.playlists())
+                return self._json({"ok": False, "error": "music disabled"}, 400)
+
             if route == "/thumb":
                 qs = parse_qs(u.query or "")
                 name = (qs.get("name") or [""])[0]
@@ -1625,6 +1763,22 @@ def make_handler(mgr, slideshow, hub, music):
                     return self._json(music.set_volume(body.get("volume")))
                 return self._json({"ok": False, "error": "music disabled"}, 400)
 
+            if route == "/api/music/playlist/set":
+                if not music:
+                    return self._json({"ok": False, "error": "music disabled"}, 400)
+                pid = body.get("id") or body.get("playlist_id") or ""
+                if not pid:
+                    return self._json({"ok": False, "error": "missing playlist id"}, 400)
+                res = music.set_playlist(pid)
+                if res.get("ok") is False:
+                    return self._json(res, 400)
+                return self._json(res)
+
+            if route == "/api/music/playlist/clear":
+                if not music:
+                    return self._json({"ok": False, "error": "music disabled"}, 400)
+                return self._json(music.clear_playlist())
+
             if route == "/api/cec/playback":
                 res = run_cec(["--playback", "-S"])
                 return self._json(res, 200 if res["ok"] else 500)
@@ -1752,6 +1906,14 @@ INDEX_HTML = r"""<!doctype html>
     <button class="gray" onclick="setMusicVolume()">Set</button>
     <span id="musicNow" class="small"></span>
   </div>
+  <div class="row" style="margin-bottom:10px;">
+    <span class="small">Playlist:</span>
+    <select id="playlistSel" style="min-width:220px;"></select>
+    <button class="gray" onclick="playlistStart()">Run playlist</button>
+    <button class="gray" onclick="playlistClear()">Random</button>
+    <button class="gray" onclick="loadPlaylists()">Refresh playlists</button>
+    <span id="playlistStatus" class="small"></span>
+  </div>
 
   <h3>Images</h3>
   <div id="status" class="small"></div>
@@ -1762,6 +1924,8 @@ let ws = null;
 let current = "";
 let wsAttempts = 0;
 let wsTimer = null;
+let activePlaylistId = "";
+let activePlaylistName = "";
 
 function baseDirPath() {
   return location.pathname.replace(/[^\/]*$/, "");
@@ -1825,6 +1989,7 @@ function connectWS(){
         if(msg.track || msg.label){
           setMusicNow(msg.track || null, msg.label || "");
         }
+        updatePlaylistState(msg);
       }
     };
   } catch(e) {
@@ -1923,6 +2088,92 @@ function setMusicNow(track, label){
   }
 }
 
+function selectHasValue(sel, value){
+  if(!sel) return false;
+  for(const opt of sel.options){
+    if(opt.value == value){
+      sel.value = value;
+      return true;
+    }
+  }
+  return false;
+}
+
+function updatePlaylistState(state){
+  const sel = document.getElementById('playlistSel');
+  const status = document.getElementById('playlistStatus');
+  if(!status) return;
+
+  if(state && state.source === 'playlist' && state.playlist && state.playlist.id){
+    activePlaylistId = String(state.playlist.id);
+    activePlaylistName = String(state.playlist.name || '').trim();
+    status.textContent = `Playlist: ${activePlaylistName || 'Unknown'}`;
+    if(sel){
+      selectHasValue(sel, activePlaylistId);
+    }
+  } else {
+    activePlaylistId = "";
+    activePlaylistName = "";
+    status.textContent = "Playlist: Random";
+  }
+}
+
+async function loadPlaylists(){
+  const sel = document.getElementById('playlistSel');
+  if(!sel) return;
+
+  const prev = sel.value;
+  sel.innerHTML = "";
+
+  const j = await apiGet('api/music/playlists');
+  if(!j || j.ok === false){
+    const opt = document.createElement('option');
+    opt.value = "";
+    opt.textContent = "(playlists unavailable)";
+    sel.appendChild(opt);
+    sel.disabled = true;
+    return;
+  }
+
+  sel.disabled = false;
+  const pls = j.playlists || [];
+  if(!pls.length){
+    const opt = document.createElement('option');
+    opt.value = "";
+    opt.textContent = "(no playlists)";
+    sel.appendChild(opt);
+    return;
+  }
+
+  for(const p of pls){
+    if(!p.id) continue;
+    const opt = document.createElement('option');
+    opt.value = String(p.id);
+    const cnt = p.songCount ? ` (${p.songCount})` : '';
+    opt.textContent = `${p.name || 'Untitled'}${cnt}`;
+    sel.appendChild(opt);
+  }
+
+  if(!selectHasValue(sel, activePlaylistId)){
+    selectHasValue(sel, prev);
+  }
+}
+
+async function playlistStart(){
+  const sel = document.getElementById('playlistSel');
+  if(!sel || !sel.value){
+    setStatus("Select a playlist", true);
+    return;
+  }
+  await apiPost('api/music/playlist/set', {id: sel.value});
+  await musicState();
+}
+
+async function playlistClear(){
+  await apiPost('api/music/playlist/clear', {});
+  await musicState();
+}
+
 async function musicState(){
   const j = await apiGet('api/music/state');
   if(!j || j.ok === false){
@@ -1932,6 +2183,7 @@ async function musicState(){
     document.getElementById("musicVol").value = j.volume;
   }
   setMusicNow(j.track || null, j.label || "");
+  updatePlaylistState(j);
 }
 
 async function musicToggle(){
@@ -2131,6 +2383,7 @@ document.getElementById("fileCam").addEventListener("change", (e) => {
 // start
 connectWS();
 loadImages();
+loadPlaylists();
 musicState();
 setInterval(musicState, 5000);
 </script>
