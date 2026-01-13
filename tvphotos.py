@@ -1720,6 +1720,7 @@ def parse_multipart_first_file(content_type, body_bytes):
 def make_handler(mgr, slideshow, hub, music):
     class Handler(BaseHTTPRequestHandler):
         server_version = "fehb/1.5"
+        protocol_version = "HTTP/1.1"
 
         def _client_ip(self):
             xff = self.headers.get("X-Forwarded-For", "")
@@ -1736,10 +1737,12 @@ def make_handler(mgr, slideshow, hub, music):
             return
 
         def _deny(self, code=403, msg="Forbidden"):
+            data = msg.encode("utf-8", errors="ignore")
             self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(msg.encode("utf-8", errors="ignore"))
+            self.wfile.write(data)
 
         def _json(self, obj, code=200):
             data = json.dumps(obj).encode("utf-8")
@@ -1766,10 +1769,11 @@ def make_handler(mgr, slideshow, hub, music):
             if not self._client_ok():
                 return self._deny()
 
-            if self.headers.get("Upgrade", "").lower() != "websocket":
+            upgrade = self.headers.get("Upgrade", "")
+            if "websocket" not in upgrade.lower():
                 return self._deny(400, "Missing Upgrade: websocket")
 
-            key = self.headers.get("Sec-WebSocket-Key", "")
+            key = self.headers.get("Sec-WebSocket-Key", "").strip()
             if not key:
                 return self._deny(400, "Missing Sec-WebSocket-Key")
 
@@ -1782,6 +1786,7 @@ def make_handler(mgr, slideshow, hub, music):
             self.end_headers()
 
             sock = self.connection
+            self.close_connection = False
             # Keep WS open indefinitely; browser may be idle for long periods.
             sock.settimeout(None)
             hub.add(sock)
