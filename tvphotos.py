@@ -1306,10 +1306,10 @@ class ImageManager:
                     self.music_bar_strategy = MUSIC_BAR_STRATEGY_DEFAULT
                 if self.music_bar_ratio <= 0:
                     self.music_bar_ratio = MUSIC_BAR_WIDTH_RATIO_DEFAULT
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
 
     def save_state(self):
         with self.lock:
