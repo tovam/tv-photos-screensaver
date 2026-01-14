@@ -76,6 +76,7 @@ NAVIDROME_CLIENT_NAME = "tvphotos"
 NAVIDROME_RANDOM_SIZE = 50
 MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
 MPV_CACHE_SECS = 30
+MPV_CACHE_PAUSE_WAIT_SECS = 5
 MPV_VOLUME_MAX = 200
 
 
@@ -386,6 +387,8 @@ class MPVController:
             "--input-ipc-server=" + self.socket_path,
             "--cache=yes",
             f"--cache-secs={MPV_CACHE_SECS}",
+            "--cache-pause-initial=yes",
+            f"--cache-pause-wait={MPV_CACHE_PAUSE_WAIT_SECS}",
             f"--volume-max={MPV_VOLUME_MAX}",
             "--quiet",
         ]
