@@ -70,6 +70,7 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QListWidget,
     QListWidgetItem,
+    QPushButton,
 )
 
 
@@ -685,6 +686,7 @@ class MusicManager:
         self.queue = []
         self.current = None
         self.paused = False
+        self.started = False
         self.history = []
         self._override_next = None
         self._suppress_history_once = False
@@ -1024,6 +1026,11 @@ class MusicManager:
                 time.sleep(2)
                 continue
 
+            if not self.started:
+                self._refresh_ui()
+                time.sleep(1)
+                continue
+
             if self.current is None:
                 song = self._next_song()
                 if song:
@@ -1121,6 +1128,7 @@ class MusicManager:
             self.queue = []
             self.current = None
             self.paused = False
+            self.started = True
             self.history = []
             self._override_next = None
             self._suppress_history_once = False
@@ -1141,6 +1149,7 @@ class MusicManager:
             self.queue = []
             self.current = None
             self.paused = False
+            self.started = True
             self.history = []
             self._override_next = None
             self._suppress_history_once = False
@@ -1153,7 +1162,11 @@ class MusicManager:
         if not self.enabled:
             return self.state()
         with self.lock:
-            self.paused = not self.paused
+            if not self.started:
+                self.started = True
+                self.paused = False
+            else:
+                self.paused = not self.paused
             paused = self.paused
         self.mpv.set_pause(paused)
         self._broadcast()
@@ -1173,6 +1186,7 @@ class MusicManager:
             return self.state()
         with self.lock:
             self.paused = False
+            self.started = True
         self.mpv.set_pause(False)
         self._broadcast()
         return self.state()
@@ -1181,6 +1195,7 @@ class MusicManager:
         if not self.enabled:
             return self.state()
         with self.lock:
+            self.started = True
             target = None
             if self.history:
                 target = self.history.pop()
@@ -1221,6 +1236,7 @@ class MusicManager:
             return self.state()
         self.mpv.stop()
         with self.lock:
+            self.started = True
             self.current = None
             self.paused = False
         self._broadcast()
@@ -2147,6 +2163,9 @@ class Slideshow(QWidget):
         self.menu_playlists_list = None
         self.menu_playlists_status = None
         self.menu_playlists_tab_index = None
+        self.menu_live_button = None
+        self.menu_live_status = None
+        self.menu_live_tab_index = None
         self._menu_playlists_refreshing = False
         self._menu_playlist_action_running = False
         self.live_container = None
@@ -2157,8 +2176,10 @@ class Slideshow(QWidget):
         self._live_stream_thread = None
         self._pending_live_proxy_url = None
         self._pending_live_proxy_server = None
+        self.live_playing = False
+        self.live_starting = False
+        self._live_status_text = ""
         self._init_menu_ui()
-        self._init_live_stream()
 
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
@@ -2401,6 +2422,9 @@ class Slideshow(QWidget):
         tab_playlists = self._make_playlist_tab()
         self.menu_playlists_tab_index = self.menu_tabs.addTab(tab_playlists, "Playlists")
 
+        tab_live = self._make_dailymotion_tab()
+        self.menu_live_tab_index = self.menu_tabs.addTab(tab_live, "Dailymotion")
+
         tab_notes = self._make_placeholder_tab(
             "Random notes",
             "Sample items:\n"
@@ -2438,19 +2462,32 @@ class Slideshow(QWidget):
         self._live_stream_thread.start()
 
     def _load_live_stream_backend(self):
+        def _fail(msg):
+            try:
+                QMetaObject.invokeMethod(
+                    self,
+                    "_on_live_stream_failed",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, msg),
+                )
+            except Exception:
+                pass
         try:
             stream_url = fetch_stream_url(LIVE_STREAM_VIDEO_ID, LIVE_STREAM_REFERER)
         except Exception as exc:
             log.error("Live stream metadata fetch failed: %s", exc)
+            _fail("Live stream metadata failed")
             return
         if not stream_url:
             log.error("Live stream metadata returned no stream URL")
+            _fail("Live stream unavailable")
             return
 
         try:
             proxy_server, proxy_url = start_hls_proxy(stream_url, LIVE_STREAM_REFERER)
         except Exception as exc:
             log.error("Live stream proxy start failed: %s", exc)
+            _fail("Live stream proxy failed")
             return
 
         self._pending_live_proxy_server = proxy_server
@@ -2469,6 +2506,7 @@ class Slideshow(QWidget):
                 pass
             self._pending_live_proxy_server = None
             self._pending_live_proxy_url = None
+            _fail("Live stream attach failed")
 
     @pyqtSlot()
     def _attach_live_stream(self):
@@ -2515,9 +2553,17 @@ class Slideshow(QWidget):
 
         def _log_playback(state):
             log.debug("Live stream playback state: %s", state)
+            try:
+                playing = state == QMediaPlayer.PlaybackState.PlayingState
+            except Exception:
+                playing = False
+            self.live_playing = playing
+            self.live_starting = False
+            self._update_live_controls()
 
         def _log_error(*args):
             log.error("Live stream player error: %s", args)
+            self._on_live_stream_failed("Live stream error")
 
         try:
             self.live_player.mediaStatusChanged.connect(_log_media_status)
@@ -2530,6 +2576,9 @@ class Slideshow(QWidget):
         self.live_container.show()
         self.live_container.raise_()
         self.live_player.play()
+        self.live_starting = False
+        self.live_playing = True
+        self._update_live_controls("Playing")
         log.info("Live stream overlay shown")
 
     def _make_placeholder_tab(self, title, body):
@@ -2571,15 +2620,101 @@ class Slideshow(QWidget):
 
         return w
 
+    def _make_dailymotion_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        hint = QLabel("Control the live stream overlay.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: rgba(255,255,255,0.75);")
+        layout.addWidget(hint)
+
+        self.menu_live_button = QPushButton("Start live stream")
+        self.menu_live_button.setMinimumHeight(36)
+        self.menu_live_button.clicked.connect(self._toggle_live_stream)
+        layout.addWidget(self.menu_live_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.menu_live_status = QLabel("")
+        self.menu_live_status.setWordWrap(True)
+        self.menu_live_status.setStyleSheet("color: rgba(255,255,255,0.6);")
+        layout.addWidget(self.menu_live_status)
+        layout.addStretch(1)
+
+        self._update_live_controls("Stopped")
+        return w
+
     @pyqtSlot(int)
     def _menu_tab_changed(self, idx):
         if idx == self.menu_playlists_tab_index:
             self.refresh_menu_playlists()
+        if idx == self.menu_live_tab_index:
+            self._update_live_controls()
 
     def _set_menu_playlist_status(self, text):
         if not self.menu_playlists_status:
             return
         self.menu_playlists_status.setText(text or "")
+
+    def _update_live_controls(self, status_text=None):
+        if status_text is not None:
+            self._live_status_text = status_text
+        if not self.menu_live_button or not self.menu_live_status:
+            return
+        if not QT_MULTIMEDIA_AVAILABLE:
+            self.menu_live_button.setEnabled(False)
+            self.menu_live_button.setText("Live stream unavailable")
+            self.menu_live_status.setText("QtMultimedia unavailable")
+            return
+        if self.live_starting:
+            self.menu_live_button.setEnabled(False)
+            self.menu_live_button.setText("Starting...")
+            self.menu_live_status.setText(self._live_status_text or "Starting live stream...")
+            return
+        self.menu_live_button.setEnabled(True)
+        if not self.live_player:
+            self.menu_live_button.setText("Start live stream")
+            self.menu_live_status.setText(self._live_status_text or "Stopped")
+            return
+        if self.live_playing:
+            self.menu_live_button.setText("Pause live stream")
+            self.menu_live_status.setText(self._live_status_text or "Playing")
+        else:
+            self.menu_live_button.setText("Resume live stream")
+            self.menu_live_status.setText(self._live_status_text or "Paused")
+
+    def _toggle_live_stream(self):
+        if not QT_MULTIMEDIA_AVAILABLE:
+            self._update_live_controls("QtMultimedia unavailable")
+            return
+        if self.live_player:
+            if self.live_playing:
+                try:
+                    self.live_player.pause()
+                except Exception:
+                    pass
+                self.live_playing = False
+                self._update_live_controls("Paused")
+            else:
+                try:
+                    self.live_player.play()
+                except Exception:
+                    pass
+                self.live_playing = True
+                self._update_live_controls("Playing")
+            return
+        if self.live_starting:
+            return
+        self.live_starting = True
+        self._update_live_controls("Starting live stream...")
+        self._init_live_stream()
+
+    @pyqtSlot(str)
+    def _on_live_stream_failed(self, msg):
+        self.live_starting = False
+        self.live_playing = False
+        self._update_live_controls(msg or "Live stream failed")
 
     def refresh_menu_playlists(self):
         if not self.menu_playlists_list:
