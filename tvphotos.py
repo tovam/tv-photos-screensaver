@@ -2228,7 +2228,8 @@ class Slideshow(QWidget):
         self.menu_playlists_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.menu_playlists_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.menu_playlists_list.itemActivated.connect(self._menu_playlist_activate)
-        layout.addWidget(self.menu_playlists_list)
+        self.menu_playlists_list.setMinimumHeight(160)
+        layout.addWidget(self.menu_playlists_list, 1)
 
         self.menu_playlists_status = QLabel("")
         self.menu_playlists_status.setWordWrap(True)
