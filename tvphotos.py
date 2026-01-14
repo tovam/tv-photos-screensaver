@@ -3224,6 +3224,29 @@ INDEX_HTML = r"""<!doctype html>
     .thumb-placeholder { font-size: 10px; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.8px; }
 
     .section-title { font-size: 16px; letter-spacing: 0.2px; margin: 8px 0 6px; }
+    .live-row {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 12px;
+    }
+    .live-card {
+      width: min(25vw, 360px);
+      min-width: 240px;
+    }
+    .live-frame {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #000;
+      border: 1px solid #232a33;
+    }
+    .live-frame iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      display: block;
+    }
 
     @media (max-width: 1100px) {
       .deck-grid { grid-template-columns: 1fr; }
@@ -3232,6 +3255,8 @@ INDEX_HTML = r"""<!doctype html>
       .topbar { grid-template-columns: 1fr; }
       .thumb-stack { align-items: flex-start; }
       #currentThumbWrap { width: min(320px, 100%); }
+      .live-row { justify-content: stretch; }
+      .live-card { width: 100%; }
     }
 
     /* Hide file inputs but keep them accessible */
@@ -3337,6 +3362,20 @@ INDEX_HTML = r"""<!doctype html>
             <span id="musicBarHint" class="small"></span>
           </div>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="live-row">
+    <div class="panel live-card">
+      <div class="panel-title">Live</div>
+      <div class="live-frame">
+        <iframe
+          title="Dailymotion live"
+          src="https://geo.dailymotion.com/player.html?video=x3b68jn"
+          allow="autoplay; fullscreen; picture-in-picture; web-share"
+          allowfullscreen
+        ></iframe>
       </div>
     </div>
   </section>
