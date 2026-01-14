@@ -1946,6 +1946,11 @@ class Slideshow(QWidget):
         self.menu_panel = None
         self.menu_tabs = None
         self.menu_history_list = None
+        self.menu_playlists_list = None
+        self.menu_playlists_status = None
+        self.menu_playlists_tab_index = None
+        self._menu_playlists_refreshing = False
+        self._menu_playlist_action_running = False
         self._init_menu_ui()
 
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
@@ -2168,6 +2173,9 @@ class Slideshow(QWidget):
         self.menu_history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.menu_tabs.addTab(self.menu_history_list, "History")
 
+        tab_playlists = self._make_playlist_tab()
+        self.menu_playlists_tab_index = self.menu_tabs.addTab(tab_playlists, "Playlists")
+
         tab_notes = self._make_placeholder_tab(
             "Random notes",
             "Sample items:\n"
@@ -2186,6 +2194,8 @@ class Slideshow(QWidget):
         )
         self.menu_tabs.addTab(tab_status, "Status")
 
+        self.menu_tabs.currentChanged.connect(self._menu_tab_changed)
+
         overlay_layout.addWidget(self.menu_panel, alignment=Qt.AlignmentFlag.AlignCenter)
         self._layout_menu()
 
@@ -2202,6 +2212,250 @@ class Slideshow(QWidget):
         layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignTop)
         layout.addStretch(1)
         return w
+
+    def _make_playlist_tab(self):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        hint = QLabel("Select a Navidrome playlist to play. Use Random to return to shuffle.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: rgba(255,255,255,0.75);")
+        layout.addWidget(hint)
+
+        self.menu_playlists_list = QListWidget()
+        self.menu_playlists_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.menu_playlists_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.menu_playlists_list.itemActivated.connect(self._menu_playlist_activate)
+        layout.addWidget(self.menu_playlists_list)
+
+        self.menu_playlists_status = QLabel("")
+        self.menu_playlists_status.setWordWrap(True)
+        self.menu_playlists_status.setStyleSheet("color: rgba(255,255,255,0.6);")
+        layout.addWidget(self.menu_playlists_status)
+
+        return w
+
+    @pyqtSlot(int)
+    def _menu_tab_changed(self, idx):
+        if idx == self.menu_playlists_tab_index:
+            self.refresh_menu_playlists()
+
+    def _set_menu_playlist_status(self, text):
+        if not self.menu_playlists_status:
+            return
+        self.menu_playlists_status.setText(text or "")
+
+    def refresh_menu_playlists(self):
+        if not self.menu_playlists_list:
+            return
+        if self._menu_playlists_refreshing:
+            return
+
+        music = self.music_manager
+        self.menu_playlists_list.clear()
+        self._set_menu_playlist_status("")
+
+        if not music or not music.enabled:
+            item = QListWidgetItem("Music disabled")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.menu_playlists_list.addItem(item)
+            self.menu_playlists_list.setEnabled(False)
+            return
+
+        self.menu_playlists_list.setEnabled(False)
+        self._menu_playlists_refreshing = True
+        item = QListWidgetItem("Loading playlists...")
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+        self.menu_playlists_list.addItem(item)
+
+        def worker():
+            try:
+                playlists = music.playlists()
+            except Exception as e:
+                playlists = {"ok": False, "error": str(e)}
+            try:
+                state = music.state()
+            except Exception as e:
+                state = {"ok": False, "error": str(e)}
+            payload = json.dumps({"playlists": playlists, "state": state})
+            try:
+                QMetaObject.invokeMethod(
+                    self,
+                    "_apply_menu_playlists_json",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, payload),
+                )
+            except Exception:
+                self._menu_playlists_refreshing = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot(str)
+    def _apply_menu_playlists_json(self, payload):
+        self._menu_playlists_refreshing = False
+        try:
+            data = json.loads(payload) if payload else {}
+        except Exception:
+            data = {}
+        playlists = data.get("playlists") or {}
+        state = data.get("state") or {}
+        self._populate_menu_playlists(playlists, state)
+
+    def _populate_menu_playlists(self, res, state):
+        if not self.menu_playlists_list:
+            return
+
+        self.menu_playlists_list.clear()
+        self.menu_playlists_list.setEnabled(True)
+
+        refresh_item = QListWidgetItem("Refresh playlists")
+        refresh_item.setData(Qt.ItemDataRole.UserRole, "__refresh__")
+        self.menu_playlists_list.addItem(refresh_item)
+
+        active_id = None
+        active_name = ""
+        if state and state.get("ok") and state.get("playlist"):
+            pl = state.get("playlist") or {}
+            pid = pl.get("id")
+            if pid is not None:
+                active_id = str(pid)
+                active_name = (pl.get("name") or "").strip()
+
+        random_label = "Random / Shuffle"
+        if not active_id:
+            random_label = "Now: " + random_label
+        random_item = QListWidgetItem(random_label)
+        random_item.setData(Qt.ItemDataRole.UserRole, "__random__")
+        if not active_id:
+            font = random_item.font()
+            font.setBold(True)
+            random_item.setFont(font)
+        self.menu_playlists_list.addItem(random_item)
+
+        if not res or not res.get("ok"):
+            err = "Unable to load playlists"
+            if res and res.get("error"):
+                err = str(res.get("error"))
+            self._set_menu_playlist_status(err)
+            err_item = QListWidgetItem(err)
+            err_item.setFlags(err_item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.menu_playlists_list.addItem(err_item)
+            return
+
+        pls = res.get("playlists") or []
+        if not pls:
+            self._set_menu_playlist_status("No playlists found")
+            none_item = QListWidgetItem("No playlists found")
+            none_item.setFlags(none_item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.menu_playlists_list.addItem(none_item)
+            return
+
+        for pl in pls:
+            pid = pl.get("id")
+            if pid is None:
+                continue
+            pid = str(pid)
+            name = (pl.get("name") or "").strip() or pid
+            count = pl.get("songCount") or 0
+            if count:
+                label = f"{name}  ({count} songs)"
+            else:
+                label = name
+            if pid == active_id:
+                label = "Now: " + label
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, pid)
+            if pid == active_id:
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self.menu_playlists_list.addItem(item)
+
+        if active_id:
+            status = f"Playing: {active_name or 'playlist'}"
+        else:
+            status = "Random mode"
+        status = f"{status} - {len(pls)} playlists"
+        self._set_menu_playlist_status(status)
+
+    def _menu_playlist_activate(self, item):
+        if not item:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        if data == "__refresh__":
+            self.refresh_menu_playlists()
+            return
+        if data == "__random__":
+            self._run_menu_playlist_action("clear")
+            return
+        self._run_menu_playlist_action("set", playlist_id=str(data))
+
+    def _run_menu_playlist_action(self, action, playlist_id=None):
+        if self._menu_playlist_action_running:
+            return
+        music = self.music_manager
+        if not music or not music.enabled:
+            self._set_menu_playlist_status("Music disabled")
+            return
+
+        self._menu_playlist_action_running = True
+        if self.menu_playlists_list:
+            self.menu_playlists_list.setEnabled(False)
+        if action == "clear":
+            self._set_menu_playlist_status("Switching to random...")
+        else:
+            self._set_menu_playlist_status("Starting playlist...")
+
+        def worker():
+            try:
+                if action == "clear":
+                    result = music.clear_playlist()
+                else:
+                    result = music.set_playlist(playlist_id)
+            except Exception as e:
+                result = {"ok": False, "error": str(e)}
+            payload = json.dumps({"action": action, "result": result})
+            try:
+                QMetaObject.invokeMethod(
+                    self,
+                    "_apply_menu_playlist_action_json",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG(str, payload),
+                )
+            except Exception:
+                self._menu_playlist_action_running = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot(str)
+    def _apply_menu_playlist_action_json(self, payload):
+        self._menu_playlist_action_running = False
+        try:
+            data = json.loads(payload) if payload else {}
+        except Exception:
+            data = {}
+        res = data.get("result") or {}
+        if not res.get("ok"):
+            self._set_menu_playlist_status(res.get("error") or "Playlist action failed")
+        else:
+            if data.get("action") == "clear":
+                self._set_menu_playlist_status("Random mode")
+            else:
+                pl = res.get("playlist") or {}
+                name = (pl.get("name") or "").strip()
+                if name:
+                    self._set_menu_playlist_status(f"Playing: {name}")
+                else:
+                    self._set_menu_playlist_status("Playlist started")
+
+        if self.menu_playlists_list:
+            self.menu_playlists_list.setEnabled(True)
+        self.refresh_menu_history()
+        self.refresh_menu_playlists()
 
     def _layout_menu(self):
         if not self.menu_overlay or not self.menu_panel:
@@ -2257,6 +2511,7 @@ class Slideshow(QWidget):
             return
         self._layout_menu()
         self.refresh_menu_history()
+        self.refresh_menu_playlists()
         self.menu_overlay.show()
         self.menu_overlay.raise_()
         if self.menu_panel:
