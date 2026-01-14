@@ -38,7 +38,18 @@ from PIL.ImageQt import ImageQt
 
 from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot
 from PyQt6.QtGui import QPixmap, QFont, QKeySequence, QShortcut
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget, QGraphicsDropShadowEffect, QProgressBar
+from PyQt6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QWidget,
+    QGraphicsDropShadowEffect,
+    QProgressBar,
+    QFrame,
+    QVBoxLayout,
+    QTabWidget,
+    QListWidget,
+    QListWidgetItem,
+)
 
 
 # ----------------------------
@@ -489,6 +500,12 @@ class MusicManager:
         self._last_ui_progress = -1
         self._last_ui_duration = -1
 
+        if self.slideshow:
+            try:
+                self.slideshow.attach_music(self)
+            except Exception:
+                pass
+
         cfg = read_navidrome_config()
         if not cfg:
             self.error = f"Missing or incomplete {NAVIDROME_CONFIG_PATH}"
@@ -527,6 +544,15 @@ class MusicManager:
         try:
             QMetaObject.invokeMethod(self.slideshow, "set_music_duration",
                 Qt.ConnectionType.QueuedConnection, Q_ARG(int, int(seconds)))
+        except Exception:
+            pass
+
+    def _notify_history(self):
+        if not self.slideshow:
+            return
+        try:
+            QMetaObject.invokeMethod(self.slideshow, "refresh_menu_history",
+                Qt.ConnectionType.QueuedConnection)
         except Exception:
             pass
 
@@ -789,6 +815,7 @@ class MusicManager:
         self._song_label(track)
         self._refresh_ui()
         self._broadcast()
+        self._notify_history()
 
     def _loop(self):
         while True:
@@ -829,6 +856,30 @@ class MusicManager:
                 "playlist_idx": self.playlist_idx,
                 "playlist_count": len(self.playlist_entries) if self.playlist_id else 0,
             }
+
+    def history_labels(self, max_items=40, include_current=True):
+        if not self.enabled:
+            return []
+        with self.lock:
+            hist = list(self.history)
+            current = dict(self.current) if self.current else None
+
+        if max_items and max_items > 0:
+            hist = hist[-int(max_items):]
+
+        labels = []
+        if include_current and current:
+            label = self._build_label(current).strip()
+            if not label:
+                label = "Unknown track"
+            labels.append(f"Now: {label}")
+
+        for track in reversed(hist):
+            label = self._build_label(track).strip()
+            if not label:
+                label = "Unknown track"
+            labels.append(label)
+        return labels
 
     def playlists(self):
         if not self.enabled:
@@ -874,6 +925,7 @@ class MusicManager:
             self._suppress_history_once = False
         self.mpv.stop()
         self._broadcast()
+        self._notify_history()
         return self.state()
 
     def clear_playlist(self):
@@ -893,6 +945,7 @@ class MusicManager:
             self._suppress_history_once = False
         self.mpv.stop()
         self._broadcast()
+        self._notify_history()
         return self.state()
 
     def toggle_pause(self):
@@ -959,6 +1012,7 @@ class MusicManager:
 
         self.mpv.stop()
         self._broadcast()
+        self._notify_history()
         return self.state()
 
     def next(self):
@@ -1728,11 +1782,46 @@ def run_cec(args):
     }
 
 
-def start_cec_key_listener(music):
-    if not music or not music.enabled:
+def start_cec_key_listener(music, slideshow=None):
+    if not slideshow and (not music or not music.enabled):
         return None
 
     def on_key(evt: CecKeyEvent):
+        if evt.name == "SELECT":
+            if slideshow:
+                try:
+                    QMetaObject.invokeMethod(slideshow, "toggle_menu",
+                        Qt.ConnectionType.QueuedConnection)
+                except Exception:
+                    pass
+            return
+        if evt.name == "EXIT":
+            if slideshow:
+                try:
+                    QMetaObject.invokeMethod(slideshow, "hide_menu",
+                        Qt.ConnectionType.QueuedConnection)
+                except Exception:
+                    pass
+            return
+        if evt.name == "LEFT":
+            if slideshow:
+                try:
+                    QMetaObject.invokeMethod(slideshow, "move_menu_tab",
+                        Qt.ConnectionType.QueuedConnection, Q_ARG(int, -1))
+                except Exception:
+                    pass
+            return
+        if evt.name == "RIGHT":
+            if slideshow:
+                try:
+                    QMetaObject.invokeMethod(slideshow, "move_menu_tab",
+                        Qt.ConnectionType.QueuedConnection, Q_ARG(int, 1))
+                except Exception:
+                    pass
+            return
+
+        if not music or not music.enabled:
+            return
         if evt.name == "PAUSE":
             music.toggle_pause()
         elif evt.name == "FORWARD":
@@ -1782,6 +1871,7 @@ class Slideshow(QWidget):
         self._playlist = []
         self._idx = 0
         self.current_path = None
+        self.music_manager = None
         self.music_bar_strategy = int(getattr(self.mgr, "music_bar_strategy", MUSIC_BAR_STRATEGY_DEFAULT))
         self.music_bar_ratio = float(getattr(self.mgr, "music_bar_ratio", MUSIC_BAR_WIDTH_RATIO_DEFAULT))
         self.music_bar_duration_s = None
@@ -1848,6 +1938,12 @@ class Slideshow(QWidget):
         bar_shadow.setColor(Qt.GlobalColor.black)
         self.music_bar.setGraphicsEffect(bar_shadow)
         self.music_bar.hide()
+
+        self.menu_overlay = None
+        self.menu_panel = None
+        self.menu_tabs = None
+        self.menu_history_list = None
+        self._init_menu_ui()
 
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
@@ -1916,6 +2012,7 @@ class Slideshow(QWidget):
     def resizeEvent(self, event):
         self.bg.setGeometry(self.rect())
         self.layout_clock()
+        self._layout_menu()
         if self.current_path:
             self._show_path(self.current_path)
         super().resizeEvent(event)
@@ -2010,6 +2107,178 @@ class Slideshow(QWidget):
             self.music_bar.setValue(int(value))
             self.music_bar.show()
         self.layout_clock()
+
+    def _init_menu_ui(self):
+        self.menu_overlay = QWidget(self)
+        self.menu_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.menu_overlay.setStyleSheet("background-color: rgba(0,0,0,0.3);")
+        self.menu_overlay.hide()
+
+        overlay_layout = QVBoxLayout(self.menu_overlay)
+        overlay_layout.setContentsMargins(0, 0, 0, 0)
+        overlay_layout.setSpacing(0)
+        overlay_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.menu_panel = QFrame(self.menu_overlay)
+        self.menu_panel.setObjectName("menuPanel")
+        self.menu_panel.setStyleSheet(
+            "#menuPanel {"
+            "  background-color: rgba(18,18,18,0.88);"
+            "  border: 1px solid rgba(255,255,255,0.15);"
+            "  border-radius: 16px;"
+            "}"
+            "QTabWidget::pane {"
+            "  border: none;"
+            "}"
+            "QTabBar::tab {"
+            "  background: rgba(255,255,255,0.08);"
+            "  color: rgba(255,255,255,0.85);"
+            "  padding: 8px 14px;"
+            "  margin-right: 6px;"
+            "  border-radius: 8px;"
+            "}"
+            "QTabBar::tab:selected {"
+            "  background: rgba(255,255,255,0.18);"
+            "  color: rgba(255,255,255,1.0);"
+            "}"
+            "QListWidget {"
+            "  background: transparent;"
+            "  color: rgba(255,255,255,0.9);"
+            "  border: none;"
+            "}"
+            "QListWidget::item {"
+            "  padding: 6px 4px;"
+            "}"
+        )
+        self.menu_panel.setFont(QFont("DejaVu Sans", 13, 500))
+
+        panel_layout = QVBoxLayout(self.menu_panel)
+        panel_layout.setContentsMargins(18, 18, 18, 18)
+        panel_layout.setSpacing(12)
+
+        self.menu_tabs = QTabWidget(self.menu_panel)
+        self.menu_tabs.setDocumentMode(True)
+        self.menu_tabs.setElideMode(Qt.TextElideMode.ElideRight)
+        panel_layout.addWidget(self.menu_tabs)
+
+        self.menu_history_list = QListWidget()
+        self.menu_history_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.menu_tabs.addTab(self.menu_history_list, "History")
+
+        tab_notes = self._make_placeholder_tab(
+            "Random notes",
+            "Sample items:\n"
+            "- Shuffle mode: on\n"
+            "- Favorite genres: synth, ambient\n"
+            "- Tip: LEFT/RIGHT switches tabs"
+        )
+        self.menu_tabs.addTab(tab_notes, "Notes")
+
+        tab_status = self._make_placeholder_tab(
+            "Random status",
+            "Sample metrics:\n"
+            "- Queue depth: 12\n"
+            "- Images loaded: 248\n"
+            "- Uptime: 3h 17m"
+        )
+        self.menu_tabs.addTab(tab_status, "Status")
+
+        overlay_layout.addWidget(self.menu_panel, alignment=Qt.AlignmentFlag.AlignCenter)
+        self._layout_menu()
+
+    def _make_placeholder_tab(self, title, body):
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(8)
+
+        label = QLabel(f"{title}\n\n{body}")
+        label.setWordWrap(True)
+        label.setStyleSheet("color: rgba(255,255,255,0.85);")
+        label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addStretch(1)
+        return w
+
+    def _layout_menu(self):
+        if not self.menu_overlay or not self.menu_panel:
+            return
+        self.menu_overlay.setGeometry(self.rect())
+        w = int(self.width() * 0.65)
+        h = int(self.height() * 0.60)
+        w = max(420, min(self.width() - 40, w))
+        h = max(260, min(self.height() - 40, h))
+        self.menu_panel.setFixedSize(w, h)
+
+    def attach_music(self, music):
+        self.music_manager = music
+        self.refresh_menu_history()
+
+    @pyqtSlot()
+    def refresh_menu_history(self):
+        if not self.menu_history_list:
+            return
+        self.menu_history_list.clear()
+        music = self.music_manager
+        if not music or not music.enabled:
+            item = QListWidgetItem("Music disabled")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.menu_history_list.addItem(item)
+            return
+
+        labels = music.history_labels(max_items=40, include_current=True)
+        if not labels:
+            item = QListWidgetItem("No history yet")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled & ~Qt.ItemFlag.ItemIsSelectable)
+            self.menu_history_list.addItem(item)
+            return
+
+        for i, label in enumerate(labels):
+            item = QListWidgetItem(label)
+            if i == 0 and label.startswith("Now:"):
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self.menu_history_list.addItem(item)
+
+    @pyqtSlot()
+    def toggle_menu(self):
+        if self.menu_overlay and self.menu_overlay.isVisible():
+            self.hide_menu()
+        else:
+            self.show_menu()
+
+    @pyqtSlot()
+    def show_menu(self):
+        if not self.menu_overlay:
+            return
+        self._layout_menu()
+        self.refresh_menu_history()
+        self.menu_overlay.show()
+        self.menu_overlay.raise_()
+        if self.menu_panel:
+            self.menu_panel.raise_()
+
+    @pyqtSlot()
+    def hide_menu(self):
+        if self.menu_overlay:
+            self.menu_overlay.hide()
+
+    @pyqtSlot(int)
+    def move_menu_tab(self, delta):
+        if not self.menu_overlay or not self.menu_overlay.isVisible():
+            return
+        if not self.menu_tabs:
+            return
+        count = self.menu_tabs.count()
+        if count <= 0:
+            return
+        try:
+            d = int(delta)
+        except Exception:
+            d = 0
+        idx = (self.menu_tabs.currentIndex() + d) % count
+        self.menu_tabs.setCurrentIndex(idx)
 
     def tick(self):
         self.clock.setText(datetime.now().strftime("%A %d %B %Y\n%H:%M"))
@@ -3385,7 +3654,7 @@ def main():
     apply_locale_from_config()
     w = Slideshow(mgr, hub, delay_s=mgr.delay_s)
     music = MusicManager(hub, w)
-    cec_listener = start_cec_key_listener(music)
+    cec_listener = start_cec_key_listener(music, w)
     if cec_listener:
         atexit.register(cec_listener.stop)
         try:
