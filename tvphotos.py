@@ -8,6 +8,8 @@ import html
 import random
 import threading
 import subprocess
+import urllib.error
+import urllib.parse
 import urllib.request
 import ipaddress
 import base64
@@ -21,6 +23,7 @@ import shutil
 import atexit
 import signal
 import ctypes
+import logging
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 from datetime import datetime
@@ -33,11 +36,29 @@ if not os.environ.get("DISPLAY"):
 if not os.environ.get("XAUTHORITY"):
     os.environ["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
 
+_LOG_LEVEL = os.environ.get("TVPHOTOS_LOG_LEVEL", "INFO").upper()
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=getattr(logging, _LOG_LEVEL, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+log = logging.getLogger("tvphotos")
+
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 
 from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG, QUrl, pyqtSlot
 from PyQt6.QtGui import QPixmap, QFont, QKeySequence, QShortcut
+try:
+    from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+    QT_MULTIMEDIA_AVAILABLE = True
+except Exception as exc:
+    QAudioOutput = None
+    QMediaPlayer = None
+    QVideoWidget = None
+    QT_MULTIMEDIA_AVAILABLE = False
+    log.warning("QtMultimedia unavailable; live stream disabled: %s", exc)
 from PyQt6.QtWidgets import (
     QApplication,
     QLabel,
@@ -50,15 +71,6 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
-
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
-except Exception:
-    QWebEngineView = None
-    QWebEngineProfile = None
-    QWebEnginePage = None
-    QWebEngineSettings = None
 
 
 # ----------------------------
@@ -87,13 +99,14 @@ MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
 MPV_CACHE_SECS = 30
 MPV_CACHE_PAUSE_WAIT_SECS = 5
 MPV_VOLUME_MAX = 200
-LIVE_STREAM_URL = "https://geo.dailymotion.com/player.html?video=x3b68jn&autoplay=1"
+LIVE_STREAM_VIDEO_ID = "x3b68jn"
 LIVE_STREAM_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
+    "Chrome/120.0.0.0 Safari/537.36"
 )
-LIVE_STREAM_ACCEPT_LANG = "en-US,en;q=0.9"
+LIVE_STREAM_ORIGIN = "https://www.dailymotion.com"
+LIVE_STREAM_REFERER = f"https://www.dailymotion.com/video/{LIVE_STREAM_VIDEO_ID}"
 LIVE_STREAM_WIDTH_RATIO = 0.25
 LIVE_STREAM_MIN_WIDTH = 280
 LIVE_STREAM_ASPECT_RATIO = 16 / 9
@@ -111,6 +124,170 @@ def is_allowed_client_ip(ip_str):
 
 def now_ts():
     return int(time.time())
+
+
+def fetch_stream_url(video_id, referer_url):
+    url = f"https://www.dailymotion.com/player/metadata/video/{video_id}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": LIVE_STREAM_USER_AGENT,
+            "Accept": "application/json",
+            "Referer": referer_url,
+            "Origin": LIVE_STREAM_ORIGIN,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        data = json.load(response)
+
+    qualities = data.get("qualities", {})
+    for quality in ("auto", "1080", "720", "480", "360", "240", "144"):
+        options = qualities.get(quality) or []
+        for option in options:
+            stream_url = option.get("url")
+            if stream_url:
+                return stream_url
+
+    return None
+
+
+def _proxy_url(target_url, proxy_base):
+    encoded = urllib.parse.quote(target_url, safe="")
+    return f"{proxy_base}/proxy?u={encoded}"
+
+
+def _rewrite_tag_uri(line, base_url, proxy_base):
+    def replace(match):
+        original = match.group(1)
+        absolute = urllib.parse.urljoin(base_url, original)
+        return f'URI="{_proxy_url(absolute, proxy_base)}"'
+
+    return re.sub(r'URI="([^"]+)"', replace, line)
+
+
+def rewrite_m3u8(text, base_url, proxy_base):
+    lines = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if line.startswith("#"):
+            lines.append(_rewrite_tag_uri(raw_line, base_url, proxy_base))
+            continue
+
+        absolute = urllib.parse.urljoin(base_url, line)
+        lines.append(_proxy_url(absolute, proxy_base))
+
+    return "\n".join(lines) + "\n"
+
+
+class HLSProxyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        self._handle_request(head_only=False)
+
+    def do_HEAD(self):  # noqa: N802
+        self._handle_request(head_only=True)
+
+    def log_message(self, format, *args):
+        return
+
+    def _handle_request(self, *, head_only):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/", "/index.m3u8"):
+            upstream_url = self.server.master_url
+        elif parsed.path == "/proxy":
+            query = urllib.parse.parse_qs(parsed.query)
+            target = query.get("u", [""])[0]
+            if not target:
+                self.send_error(400, "Missing proxy target")
+                return
+            upstream_url = urllib.parse.unquote(target)
+        else:
+            self.send_error(404, "Not found")
+            return
+
+        try:
+            self._stream_upstream(upstream_url, head_only=head_only)
+        except urllib.error.HTTPError as exc:
+            self.send_error(exc.code, exc.reason)
+        except Exception as exc:
+            self.send_error(502, f"Proxy error: {exc}")
+
+    def _stream_upstream(self, upstream_url, *, head_only):
+        headers = dict(self.server.base_headers)
+        range_header = self.headers.get("Range")
+        if range_header:
+            headers["Range"] = range_header
+
+        request = urllib.request.Request(
+            upstream_url,
+            headers=headers,
+            method="HEAD" if head_only else "GET",
+        )
+
+        with urllib.request.urlopen(request, timeout=15) as response:
+            content_type = response.headers.get("Content-Type", "")
+            is_playlist = "mpegurl" in content_type or upstream_url.endswith(".m3u8")
+
+            if is_playlist and not head_only:
+                body = response.read()
+                text = body.decode("utf-8", errors="ignore")
+                rewritten = rewrite_m3u8(
+                    text,
+                    base_url=upstream_url,
+                    proxy_base=self.server.proxy_base,
+                )
+                payload = rewritten.encode("utf-8")
+
+                self.send_response(response.status)
+                self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+
+            self.send_response(response.status)
+            hop_by_hop = {
+                "connection",
+                "keep-alive",
+                "proxy-authenticate",
+                "proxy-authorization",
+                "te",
+                "trailers",
+                "transfer-encoding",
+                "upgrade",
+            }
+            for key, value in response.headers.items():
+                if key.lower() in hop_by_hop:
+                    continue
+                self.send_header(key, value)
+            if is_playlist:
+                self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+            if not head_only:
+                shutil.copyfileobj(response, self.wfile)
+
+
+def start_hls_proxy(master_url, referer_url):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), HLSProxyHandler)
+    server.master_url = master_url
+    server.base_headers = {
+        "User-Agent": LIVE_STREAM_USER_AGENT,
+        "Referer": referer_url,
+        "Origin": LIVE_STREAM_ORIGIN,
+        "Accept": "*/*",
+    }
+    host, port = server.server_address
+    server.proxy_base = f"http://{host}:{port}"
+    server.daemon_threads = True
+
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    return server, f"{server.proxy_base}/index.m3u8"
 
 
 def read_config_value(key, required=False):
@@ -1970,7 +2147,14 @@ class Slideshow(QWidget):
         self.menu_playlists_tab_index = None
         self._menu_playlists_refreshing = False
         self._menu_playlist_action_running = False
-        self.live_view = None
+        self.live_container = None
+        self.live_video = None
+        self.live_player = None
+        self.live_audio = None
+        self.live_proxy_server = None
+        self._live_stream_thread = None
+        self._pending_live_proxy_url = None
+        self._pending_live_proxy_server = None
         self._init_menu_ui()
         self._init_live_stream()
 
@@ -2073,7 +2257,7 @@ class Slideshow(QWidget):
                 self.music_bar.move(self.margin, y + mh + gap)
 
     def _layout_live_stream(self):
-        if not self.live_view:
+        if not self.live_container:
             return
         max_w = max(1, self.width() - (self.margin * 2))
         max_h = max(1, self.height() - (self.margin * 2))
@@ -2086,7 +2270,8 @@ class Slideshow(QWidget):
             w = int(h * LIVE_STREAM_ASPECT_RATIO)
         x = max(self.margin, self.width() - w - self.margin)
         y = max(self.margin, self.height() - h - self.margin)
-        self.live_view.setGeometry(x, y, w, h)
+        self.live_container.setGeometry(x, y, w, h)
+        log.debug("Live stream geometry %sx%s at %s,%s", w, h, x, y)
 
     def _music_bar_ratio_for_duration(self):
         dur = self.music_bar_duration_s
@@ -2238,34 +2423,112 @@ class Slideshow(QWidget):
         self._layout_menu()
 
     def _init_live_stream(self):
-        if QWebEngineView is None:
+        if not QT_MULTIMEDIA_AVAILABLE:
+            log.info("QtMultimedia unavailable; skipping live stream overlay")
             return
-        self.live_view = QWebEngineView(self)
-        self.live_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.live_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
-        self.live_view.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.live_view.setStyleSheet(
+        if self._live_stream_thread and self._live_stream_thread.is_alive():
+            return
+        log.info("Initializing live stream overlay")
+        self._live_stream_thread = threading.Thread(
+            target=self._load_live_stream_backend,
+            daemon=True,
+        )
+        self._live_stream_thread.start()
+
+    def _load_live_stream_backend(self):
+        try:
+            stream_url = fetch_stream_url(LIVE_STREAM_VIDEO_ID, LIVE_STREAM_REFERER)
+        except Exception as exc:
+            log.error("Live stream metadata fetch failed: %s", exc)
+            return
+        if not stream_url:
+            log.error("Live stream metadata returned no stream URL")
+            return
+
+        try:
+            proxy_server, proxy_url = start_hls_proxy(stream_url, LIVE_STREAM_REFERER)
+        except Exception as exc:
+            log.error("Live stream proxy start failed: %s", exc)
+            return
+
+        self._pending_live_proxy_server = proxy_server
+        self._pending_live_proxy_url = proxy_url
+        try:
+            QMetaObject.invokeMethod(
+                self,
+                "_attach_live_stream",
+                Qt.ConnectionType.QueuedConnection,
+            )
+        except Exception as exc:
+            log.warning("Live stream UI attach failed: %s", exc)
+            try:
+                proxy_server.shutdown()
+            except Exception:
+                pass
+            self._pending_live_proxy_server = None
+            self._pending_live_proxy_url = None
+
+    @pyqtSlot()
+    def _attach_live_stream(self):
+        if not QT_MULTIMEDIA_AVAILABLE:
+            return
+        if self.live_container:
+            return
+        proxy_server = self._pending_live_proxy_server
+        proxy_url = self._pending_live_proxy_url
+        if not proxy_server or not proxy_url:
+            return
+        self._pending_live_proxy_server = None
+        self._pending_live_proxy_url = None
+        self.live_proxy_server = proxy_server
+        atexit.register(self.live_proxy_server.shutdown)
+
+        self.live_container = QFrame(self)
+        self.live_container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.live_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.live_container.setStyleSheet(
             "background-color: #000;"
             "border: 1px solid rgba(255,255,255,0.18);"
             "border-radius: 12px;"
         )
 
-        profile = QWebEngineProfile(self.live_view)
-        profile.setHttpUserAgent(LIVE_STREAM_USER_AGENT)
-        profile.setHttpAcceptLanguage(LIVE_STREAM_ACCEPT_LANG)
-        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
-        page = QWebEnginePage(profile, self.live_view)
-        self.live_view.setPage(page)
+        container_layout = QVBoxLayout(self.live_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
 
-        settings = self.live_view.settings()
-        if QWebEngineSettings is not None:
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, False)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+        self.live_video = QVideoWidget(self.live_container)
+        container_layout.addWidget(self.live_video, 1)
 
-        page.setUrl(QUrl(LIVE_STREAM_URL))
+        self.live_audio = QAudioOutput(self)
+        self.live_audio.setVolume(0.5)
+        self.live_audio.setMuted(False)
+
+        self.live_player = QMediaPlayer(self)
+        self.live_player.setAudioOutput(self.live_audio)
+        self.live_player.setVideoOutput(self.live_video)
+        self.live_player.setSource(QUrl(proxy_url))
+
+        def _log_media_status(status):
+            log.debug("Live stream media status: %s", status)
+
+        def _log_playback(state):
+            log.debug("Live stream playback state: %s", state)
+
+        def _log_error(*args):
+            log.error("Live stream player error: %s", args)
+
+        try:
+            self.live_player.mediaStatusChanged.connect(_log_media_status)
+            self.live_player.playbackStateChanged.connect(_log_playback)
+            self.live_player.errorOccurred.connect(_log_error)
+        except Exception as exc:
+            log.warning("Live stream signal hookup failed: %s", exc)
+
         self._layout_live_stream()
-        self.live_view.show()
+        self.live_container.show()
+        self.live_container.raise_()
+        self.live_player.play()
+        log.info("Live stream overlay shown")
 
     def _make_placeholder_tab(self, title, body):
         w = QWidget()
@@ -2585,15 +2848,18 @@ class Slideshow(QWidget):
         self.menu_overlay.raise_()
         if self.menu_panel:
             self.menu_panel.raise_()
-        if self.live_view:
-            self.live_view.setVisible(False)
+        if self.live_container:
+            self.live_container.setVisible(False)
+            log.debug("Live stream hidden (menu shown)")
 
     @pyqtSlot()
     def hide_menu(self):
         if self.menu_overlay:
             self.menu_overlay.hide()
-        if self.live_view:
-            self.live_view.setVisible(True)
+        if self.live_container:
+            self.live_container.setVisible(True)
+            self.live_container.raise_()
+            log.debug("Live stream shown (menu hidden)")
 
     @pyqtSlot(int)
     def move_menu_tab(self, delta):
