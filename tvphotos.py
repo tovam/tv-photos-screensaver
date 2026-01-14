@@ -957,7 +957,7 @@ class MusicManager:
 
         if playlist_id:
             entries = playlist_entries
-            if not entries or playlist_idx >= len(entries):
+            if not entries:
                 try:
                     pl, entries = self.client.get_playlist(playlist_id)
                 except Exception:
@@ -972,7 +972,9 @@ class MusicManager:
                         self.playlist_name = name
                     self.playlist_entries = entries
 
-            song = entries[playlist_idx] if playlist_idx < len(entries) else None
+            if playlist_idx < 0 or playlist_idx >= len(entries):
+                playlist_idx = 0
+            song = entries[playlist_idx] if entries else None
             if not song:
                 return None
             with self.lock:
