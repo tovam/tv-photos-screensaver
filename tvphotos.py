@@ -36,7 +36,7 @@ if not os.environ.get("XAUTHORITY"):
 from PIL import Image, ImageOps
 from PIL.ImageQt import ImageQt
 
-from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG, pyqtSlot
+from PyQt6.QtCore import Qt, QTimer, QMetaObject, Q_ARG, QUrl, pyqtSlot
 from PyQt6.QtGui import QPixmap, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -50,6 +50,15 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
+
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+except Exception:
+    QWebEngineView = None
+    QWebEngineProfile = None
+    QWebEnginePage = None
+    QWebEngineSettings = None
 
 
 # ----------------------------
@@ -78,6 +87,16 @@ MPV_SOCKET_PATH = "/tmp/tvphotos-mpv.sock"
 MPV_CACHE_SECS = 30
 MPV_CACHE_PAUSE_WAIT_SECS = 5
 MPV_VOLUME_MAX = 200
+LIVE_STREAM_URL = "https://geo.dailymotion.com/player.html?video=x3b68jn&autoplay=1"
+LIVE_STREAM_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+LIVE_STREAM_ACCEPT_LANG = "en-US,en;q=0.9"
+LIVE_STREAM_WIDTH_RATIO = 0.25
+LIVE_STREAM_MIN_WIDTH = 280
+LIVE_STREAM_ASPECT_RATIO = 16 / 9
 
 
 def is_allowed_client_ip(ip_str):
@@ -1951,7 +1970,9 @@ class Slideshow(QWidget):
         self.menu_playlists_tab_index = None
         self._menu_playlists_refreshing = False
         self._menu_playlist_action_running = False
+        self.live_view = None
         self._init_menu_ui()
+        self._init_live_stream()
 
         QShortcut(QKeySequence("Esc"), self, activated=self.close)
         QShortcut(QKeySequence("Q"), self, activated=self.close)
@@ -2020,6 +2041,7 @@ class Slideshow(QWidget):
     def resizeEvent(self, event):
         self.bg.setGeometry(self.rect())
         self.layout_clock()
+        self._layout_live_stream()
         self._layout_menu()
         if self.current_path:
             self._show_path(self.current_path)
@@ -2049,6 +2071,22 @@ class Slideshow(QWidget):
                     bar_w = max(220, self.music.width())
                 self.music_bar.setFixedWidth(bar_w)
                 self.music_bar.move(self.margin, y + mh + gap)
+
+    def _layout_live_stream(self):
+        if not self.live_view:
+            return
+        max_w = max(1, self.width() - (self.margin * 2))
+        max_h = max(1, self.height() - (self.margin * 2))
+        w = max(LIVE_STREAM_MIN_WIDTH, int(self.width() * LIVE_STREAM_WIDTH_RATIO))
+        if w > max_w:
+            w = max_w
+        h = int(w / LIVE_STREAM_ASPECT_RATIO)
+        if h > max_h:
+            h = max_h
+            w = int(h * LIVE_STREAM_ASPECT_RATIO)
+        x = max(self.margin, self.width() - w - self.margin)
+        y = max(self.margin, self.height() - h - self.margin)
+        self.live_view.setGeometry(x, y, w, h)
 
     def _music_bar_ratio_for_duration(self):
         dur = self.music_bar_duration_s
@@ -2198,6 +2236,36 @@ class Slideshow(QWidget):
 
         overlay_layout.addWidget(self.menu_panel, alignment=Qt.AlignmentFlag.AlignCenter)
         self._layout_menu()
+
+    def _init_live_stream(self):
+        if QWebEngineView is None:
+            return
+        self.live_view = QWebEngineView(self)
+        self.live_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.live_view.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.live_view.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.live_view.setStyleSheet(
+            "background-color: #000;"
+            "border: 1px solid rgba(255,255,255,0.18);"
+            "border-radius: 12px;"
+        )
+
+        profile = QWebEngineProfile(self.live_view)
+        profile.setHttpUserAgent(LIVE_STREAM_USER_AGENT)
+        profile.setHttpAcceptLanguage(LIVE_STREAM_ACCEPT_LANG)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        page = QWebEnginePage(profile, self.live_view)
+        self.live_view.setPage(page)
+
+        settings = self.live_view.settings()
+        if QWebEngineSettings is not None:
+            settings.setAttribute(QWebEngineSettings.WebAttribute.PlaybackRequiresUserGesture, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+
+        page.setUrl(QUrl(LIVE_STREAM_URL))
+        self._layout_live_stream()
+        self.live_view.show()
 
     def _make_placeholder_tab(self, title, body):
         w = QWidget()
@@ -2517,11 +2585,15 @@ class Slideshow(QWidget):
         self.menu_overlay.raise_()
         if self.menu_panel:
             self.menu_panel.raise_()
+        if self.live_view:
+            self.live_view.setVisible(False)
 
     @pyqtSlot()
     def hide_menu(self):
         if self.menu_overlay:
             self.menu_overlay.hide()
+        if self.live_view:
+            self.live_view.setVisible(True)
 
     @pyqtSlot(int)
     def move_menu_tab(self, delta):
@@ -3224,29 +3296,6 @@ INDEX_HTML = r"""<!doctype html>
     .thumb-placeholder { font-size: 10px; opacity: 0.6; text-transform: uppercase; letter-spacing: 0.8px; }
 
     .section-title { font-size: 16px; letter-spacing: 0.2px; margin: 8px 0 6px; }
-    .live-row {
-      display: flex;
-      justify-content: flex-end;
-      margin-bottom: 12px;
-    }
-    .live-card {
-      width: min(25vw, 360px);
-      min-width: 240px;
-    }
-    .live-frame {
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      border-radius: 10px;
-      overflow: hidden;
-      background: #000;
-      border: 1px solid #232a33;
-    }
-    .live-frame iframe {
-      width: 100%;
-      height: 100%;
-      border: 0;
-      display: block;
-    }
 
     @media (max-width: 1100px) {
       .deck-grid { grid-template-columns: 1fr; }
@@ -3255,8 +3304,6 @@ INDEX_HTML = r"""<!doctype html>
       .topbar { grid-template-columns: 1fr; }
       .thumb-stack { align-items: flex-start; }
       #currentThumbWrap { width: min(320px, 100%); }
-      .live-row { justify-content: stretch; }
-      .live-card { width: 100%; }
     }
 
     /* Hide file inputs but keep them accessible */
@@ -3362,20 +3409,6 @@ INDEX_HTML = r"""<!doctype html>
             <span id="musicBarHint" class="small"></span>
           </div>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <section class="live-row">
-    <div class="panel live-card">
-      <div class="panel-title">Live</div>
-      <div class="live-frame">
-        <iframe
-          title="Dailymotion live"
-          src="https://geo.dailymotion.com/player.html?video=x3b68jn"
-          allow="autoplay; fullscreen; picture-in-picture; web-share"
-          allowfullscreen
-        ></iframe>
       </div>
     </div>
   </section>
